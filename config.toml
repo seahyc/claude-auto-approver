@@ -1,0 +1,47 @@
+[rules]
+default_action = "approve"  # approve | deny | ask — by default everything is auto-approved
+
+# No deny keywords
+[rules.deny]
+keywords = []
+
+# These commands will prompt the user for confirmation
+[rules.ask]
+keywords = [
+    "rm ",
+    "mv ",
+    "rmdir",
+    "unlink ",
+    "rancher",
+    "kubectl",
+    "docker rm",
+    "docker rmi",
+    "docker system prune",
+    "docker volume rm",
+    "push --force",
+    "push -f",
+    "push.*main",
+    "push.*master",
+    "git reset --hard",
+    "git clean",
+    "git checkout .",
+    "git restore .",
+    "--no-verify",
+    "drop ",
+    "truncate ",
+    "DELETE FROM",
+    "kill ",
+    "pkill ",
+    "killall ",
+    "sudo ",
+    "shutdown",
+    "reboot",
+    "brew uninstall",
+    "brew remove",
+    "pip uninstall",
+    "npm uninstall",
+]
+
+# Allow keywords (not strictly needed since default is approve, but explicit)
+[rules.allow]
+keywords = []
