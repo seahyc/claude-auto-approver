@@ -42,14 +42,20 @@ def decide(tool_name, command, config):
     if tool_name in SKIP_KEYWORD_CHECK or "Plan" in tool_name:
         return normalize(default), f"Skipped keyword check for {tool_name}"
 
+    # Strip safe substrings before keyword matching so they don't
+    # false-positive on dangerous keywords (e.g. "--rm" triggering "rm ")
+    normalized = command
+    for safe in rules.get("safe_substrings", []):
+        normalized = normalized.replace(safe, "")
+
     # Deny keywords (highest priority)
     for kw in rules.get("deny", {}).get("keywords", []):
-        if kw.lower() in command.lower():
+        if kw.lower() in normalized.lower():
             return "deny", f"Matched deny keyword: {kw}"
 
     # Ask keywords (second priority)
     for kw in rules.get("ask", {}).get("keywords", []):
-        if kw.lower() in command.lower():
+        if kw.lower() in normalized.lower():
             return "ask", f"Matched ask keyword: {kw}"
 
     # Allow keywords

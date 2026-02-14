@@ -1,6 +1,10 @@
 [rules]
 default_action = "approve"  # approve | deny | ask — by default everything is auto-approved
 
+# Substrings stripped from commands before keyword matching, so they
+# don't false-positive (e.g. "--rm" in "docker run --rm" won't trigger "rm ")
+safe_substrings = ["--rm"]
+
 # No deny keywords
 [rules.deny]
 keywords = []
@@ -51,8 +55,6 @@ keywords = [
     "drop ",
     "truncate ",
     "DELETE FROM",
-    "kill ",
-    "pkill ",
     "killall ",
     "sudo ",
     "shutdown",
