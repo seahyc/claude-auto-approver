@@ -5,8 +5,9 @@ import json
 import sys
 import os
 import re
-import shlex
 import datetime
+
+import bashlex
 
 try:
     import tomllib
@@ -35,13 +36,15 @@ def extract_command(tool_name, tool_input):
 
 SKIP_KEYWORD_CHECK = {"ExitPlanMode", "EnterPlanMode", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "AskUserQuestion"}
 
-# Characters that make shell command parsing unreliable — if any appear in a
-# single command segment, we cannot trust shlex to give us the actual paths.
-# Note: command-chaining chars (& | ;) are handled by segment splitting instead.
-SEGMENT_UNSAFE_CHARS = set("$`*?[]{}!><()")
-
 # Privilege-escalation prefixes — never auto-approve these via scoped rules.
 UNSAFE_PREFIXES = {"sudo", "doas"}
+
+# Sentinel: cd appeared but target can't be determined (no args, $VAR, etc.)
+_UNKNOWN_CD = object()
+
+# Characters indicating shell globs — the exact filenames can't be resolved
+# statically, but the *directory* containing the glob can still be checked.
+GLOB_CHARS = set("*?[]{}")
 
 
 def find_git_root(cwd):
@@ -56,103 +59,215 @@ def find_git_root(cwd):
         current = parent
 
 
-def _find_keyword_segment(command, keyword):
-    """Split a compound command on ``&&  ||  ;  |`` and return the segment
-    containing *keyword*.
+def _strip_quoted_contents(text):
+    """Replace contents of quoted strings with empty markers.
 
-    Returns ``None`` if:
-    - the keyword isn't found in any segment, or
-    - a prior segment contains ``cd`` (meaning cwd may have changed).
+    Prevents keywords inside commit messages, echo strings, etc. from
+    triggering false positives.  The actual command tokens outside quotes
+    are preserved.
     """
-    segments = re.split(r"\s*(?:&&|\|\||;|\|)\s*", command)
-
-    for i, seg in enumerate(segments):
-        if keyword.lower() in seg.lower():
-            # Bail if any earlier segment changes directory
-            for prev in segments[:i]:
-                if re.search(r"(?:^|\s)cd(?:\s|$)", prev):
-                    return None
-            return seg
-
-    return None
+    text = re.sub(r'"[^"]*"', '""', text)
+    text = re.sub(r"'[^']*'", "''", text)
+    return text
 
 
-def _strip_redirections(segment):
-    """Remove shell redirections from a command segment.
+def _strip_comments(text):
+    """Remove bash comment content (``# ...`` to end of line).
 
-    Strips patterns like ``2>&1``, ``2>/dev/null``, ``>/dev/null``,
-    ``2>>file``, ``< input``.  These don't affect which files a command
-    like ``rm`` or ``mv`` operates on.
+    Must be called **after** ``_strip_quoted_contents`` so that ``#``
+    characters inside quoted strings (already replaced with empty markers)
+    don't get misidentified as comment starts.
     """
-    # 2>&1, 1>&2, >&2, etc.
-    segment = re.sub(r"\s+\d*>&\d+", "", segment)
-    # 2>/dev/null, 2>>file, >/dev/null, >>file, etc.
-    segment = re.sub(r"\s+\d*>+\s*\S+", "", segment)
-    # <file (input redirect)
-    segment = re.sub(r"\s+<\s*\S+", "", segment)
-    return segment.strip()
+    return re.sub(r"#[^\n]*", "", text)
+
+
+def _glob_dir_prefix(path):
+    """Extract the directory containing a glob pattern.
+
+    We can't resolve the exact files a glob matches at parse time, but we
+    *can* verify that the directory they'd live in is within the project.
+
+    Examples::
+
+        build/*.o            → build
+        *.txt                → .
+        /tmp/*.txt           → /tmp
+        a/b/c*.txt           → a/b
+        build/**/*.o         → build
+        transfers/t_*.pq     → transfers
+    """
+    for i, c in enumerate(path):
+        if c in GLOB_CHARS:
+            prefix = path[:i]
+            last_sep = prefix.rfind("/")
+            if last_sep > 0:
+                return prefix[:last_sep]
+            if last_sep == 0:
+                return "/"
+            return "."
+    return path
+
+
+def _word_is_unsafe(word_node):
+    """Check if a bashlex word node contains unsafe expansions.
+
+    Unsafe expansions (``$VAR``, ``$(cmd)``, `` `cmd` ``) mean the actual
+    value is determined at runtime — we can't statically verify paths.
+    ``tilde`` expansion (``~/...``) is safe because we handle it ourselves
+    via ``os.path.expanduser()``.
+    """
+    for child in word_node.parts:
+        if child.kind in ("commandsubstitution", "parameter", "processsubstitution"):
+            return True
+    return False
+
+
+def _parse_commands(command_str):
+    """Parse a bash command string into a list of simple command descriptors.
+
+    Uses bashlex to build an AST, then walks it to extract each simple
+    command with its arguments, safety flags, and position in the chain.
+
+    Returns a list of dicts (one per simple command), or ``None`` if
+    bashlex cannot parse the input (triggering a safe fall-through to ask).
+
+    Each dict contains::
+
+        name:           Command name (first word, e.g. 'rm')
+        path_args:      Non-flag arguments (potential file paths), or None
+        is_unsafe:      True if command has globs, expansions, etc.
+        cd_target:      None if no cd preceded this command, a path string if
+                        cd had a resolvable target, or _UNKNOWN_CD if cd was
+                        present but target can't be determined
+        is_privileged:  True if first word is sudo/doas
+        raw_words:      All word values including flags (for sudo inspection)
+    """
+    try:
+        parts = bashlex.parse(command_str)
+    except Exception:
+        return None
+
+    commands = []
+    cd_target = [None]  # mutable for closure — tracks effective cwd changes
+
+    def _analyze_command(node):
+        """Extract structured info from a single bashlex command node."""
+        words = []
+        is_unsafe = False
+
+        for part in node.parts:
+            if part.kind == "word":
+                if _word_is_unsafe(part):
+                    is_unsafe = True
+                words.append(part.word)
+            elif part.kind == "redirect":
+                # Redirections are naturally separated — skip them.
+                # They don't affect which files rm/mv operate on.
+                pass
+            else:
+                # Any other node type (compound, etc.) → can't be sure
+                is_unsafe = True
+
+        if not words:
+            return None
+
+        name = words[0]
+        is_privileged = name.lower() in UNSAFE_PREFIXES
+
+        # Extract path args: skip flags, handle --
+        path_args = []
+        past_double_dash = False
+        for w in words[1:]:
+            if not past_double_dash and w == "--":
+                past_double_dash = True
+                continue
+            if not past_double_dash and w.startswith("-"):
+                continue
+            if GLOB_CHARS.intersection(w):
+                # Can't resolve exact files, but can verify the containing
+                # directory is within the project boundary.
+                path_args.append(_glob_dir_prefix(w))
+            else:
+                path_args.append(w)
+
+        return {
+            "name": name,
+            "path_args": path_args if path_args else None,
+            "is_unsafe": is_unsafe,
+            "cd_target": cd_target[0],
+            "is_privileged": is_privileged,
+            "raw_words": words,
+        }
+
+    def visit(nodes):
+        for node in nodes:
+            if node.kind == "list":
+                visit(node.parts)
+            elif node.kind == "pipeline":
+                visit(node.parts)
+            elif node.kind == "command":
+                info = _analyze_command(node)
+                if info is not None:
+                    commands.append(info)
+                    cmd_lower = info["name"].lower()
+                    if cmd_lower in ("cd", "pushd"):
+                        args = info["path_args"]
+                        if args and len(args) == 1 and not info["is_unsafe"]:
+                            new = args[0]
+                            prev = cd_target[0]
+                            if prev is None or prev is _UNKNOWN_CD:
+                                cd_target[0] = new if prev is None else _UNKNOWN_CD
+                            else:
+                                expanded = os.path.expanduser(new)
+                                if os.path.isabs(expanded):
+                                    cd_target[0] = new
+                                else:
+                                    cd_target[0] = os.path.join(prev, new)
+                        else:
+                            cd_target[0] = _UNKNOWN_CD
+                    elif cmd_lower == "popd":
+                        # Can't track the directory stack — mark unknown
+                        cd_target[0] = _UNKNOWN_CD
+            # operator, pipe nodes are skipped
+
+    visit(parts)
+    return commands
 
 
 def extract_path_args(command, keyword):
-    """Extract path arguments from a shell command using the matched keyword position.
+    """Extract path arguments from a shell command using bashlex AST parsing.
 
-    For compound commands (``rm file && yarn build``), only the segment that
-    contains the keyword is analysed.  Dangerous metacharacters are checked
-    within that segment only — command-chaining operators like ``&&`` are
-    handled by segment splitting.
+    Parses the full command into an AST, finds the simple command whose name
+    matches the keyword, and returns its path arguments if the command is
+    safe to auto-approve.
 
     Returns a list of path strings, or ``None`` if the command cannot be
     reliably parsed (triggering a fall-through to ``ask``).
     """
-    # Isolate the segment that contains the keyword
-    segment = _find_keyword_segment(command, keyword)
-    if segment is None:
+    commands = _parse_commands(command)
+    if commands is None:
         return None
 
-    # Reject privilege-escalation prefixes within the segment
-    first_word = segment.strip().split()[0] if segment.strip() else ""
-    if first_word.lower() in UNSAFE_PREFIXES:
-        return None
+    target = keyword.strip().lower()
 
-    # Strip harmless redirections (2>&1, >/dev/null, etc.) before checking
-    # for dangerous metacharacters — redirections don't affect which files
-    # rm/mv operate on.
-    segment = _strip_redirections(segment)
+    # First pass: reject if any privileged (sudo/doas) command wraps our target.
+    # e.g. "sudo rm file" → command name is "sudo", but "rm" is in raw_words.
+    for cmd in commands:
+        if cmd["is_privileged"]:
+            if target in (w.lower() for w in cmd["raw_words"]):
+                return None
 
-    # Reject segments with metacharacters that make path parsing unreliable
-    if SEGMENT_UNSAFE_CHARS.intersection(segment):
-        return None
-
-    # Locate the keyword within the segment
-    idx = segment.lower().find(keyword.lower())
-    if idx == -1:
-        return None
-
-    from_keyword = segment[idx:]
-
-    try:
-        tokens = shlex.split(from_keyword)
-    except ValueError:
-        return None
-
-    if not tokens:
-        return None
-
-    # First token is the command itself (rm, mv, etc.) — skip it
-    args = tokens[1:]
-
-    paths = []
-    past_double_dash = False
-
-    for token in args:
-        if not past_double_dash and token == "--":
-            past_double_dash = True
+    # Second pass: find the first command whose name matches our keyword.
+    for cmd in commands:
+        if cmd["name"].lower() != target:
             continue
-        if not past_double_dash and token.startswith("-"):
-            continue
-        paths.append(token)
 
-    return paths if paths else None
+        if cmd["is_unsafe"] or cmd["cd_target"] is not None:
+            return None
+
+        return cmd["path_args"]
+
+    return None
 
 
 def resolve_and_check_paths(paths, cwd, allowed_dirs):
@@ -201,41 +316,194 @@ def build_allowed_dirs(cwd, scoped_config):
 def check_scoped_rules(command, cwd, config):
     """Check if a Bash command matches scoped rules and all paths are within bounds.
 
+    Auto-approves only when **every** dangerous command in the chain is
+    accounted for.  Specifically:
+
+    1. ALL scoped keywords that match must have paths inside the project.
+    2. No ask-only keywords (those in ask but not in scoped) may appear
+       anywhere in the chain — we can't verify those commands.
+    3. No privileged (sudo/doas) command may wrap a scoped keyword.
+
     Returns ("allow", reason) if auto-approved, or None to fall through.
     """
-    scoped = config.get("rules", {}).get("scoped", {})
-    keywords = scoped.get("keywords", [])
-    if not keywords:
+    rules = config.get("rules", {})
+    scoped = rules.get("scoped", {})
+    scoped_keywords = scoped.get("keywords", [])
+    if not scoped_keywords:
         return None
 
-    # Apply safe_substring stripping (consistent with the rest of decide)
+    # Apply safe_substring stripping, quote stripping, and comment stripping
+    # (consistent with decide)
     normalized = command
-    for safe in config.get("rules", {}).get("safe_substrings", []):
+    for safe in rules.get("safe_substrings", []):
         normalized = normalized.replace(safe, "")
+    normalized = _strip_quoted_contents(normalized)
+    normalized = _strip_comments(normalized)
+    norm_lower = normalized.lower()
 
-    # Find a matching scoped keyword
-    matched_keyword = None
-    for kw in keywords:
-        if kw.lower() in normalized.lower():
-            matched_keyword = kw
-            break
-    if matched_keyword is None:
+    # Check if ANY scoped keyword matches
+    matched_scoped = [kw for kw in scoped_keywords if kw.lower() in norm_lower]
+    if not matched_scoped:
         return None
+
+    # Reject if ask-only keywords (not in scoped) also appear in the command.
+    # We can't verify those commands, so the whole chain must go to ask.
+    ask_keywords = rules.get("ask", {}).get("keywords", [])
+    scoped_set = {kw.lower() for kw in scoped_keywords}
+    for kw in ask_keywords:
+        if kw.lower() not in scoped_set and kw.lower() in norm_lower:
+            return None
 
     allowed_dirs = build_allowed_dirs(cwd, scoped)
     if not allowed_dirs:
         return None
 
-    path_args = extract_path_args(command, matched_keyword)
-    if path_args is None:
+    # Parse command AST directly so we can handle cd targets
+    commands = _parse_commands(command)
+    if commands is None:
         return None
 
-    ok, reason = resolve_and_check_paths(path_args, cwd, allowed_dirs)
-    if ok:
-        kw_name = matched_keyword.strip()
-        return "allow", f"Scoped approve: {kw_name} with all paths in project"
+    # Reject if any privileged command wraps a scoped keyword
+    scoped_names = {kw.strip().lower() for kw in scoped_keywords}
+    for cmd in commands:
+        if cmd["is_privileged"]:
+            if scoped_names.intersection(w.lower() for w in cmd["raw_words"]):
+                return None
 
-    return None
+    # Verify EVERY command that matches a scoped keyword
+    verified_names = []
+    for cmd in commands:
+        cmd_name = cmd["name"].lower()
+        if cmd_name not in scoped_names:
+            continue
+
+        if cmd["is_unsafe"]:
+            return None
+
+        path_args = cmd["path_args"]
+        if path_args is None:
+            return None
+
+        # Determine effective cwd — handle cd preceding the command
+        effective_cwd = cwd
+        cd = cmd["cd_target"]
+        if cd is _UNKNOWN_CD:
+            return None
+        if cd is not None:
+            expanded = os.path.expanduser(cd)
+            if not os.path.isabs(expanded):
+                expanded = os.path.join(cwd, expanded)
+            cd_resolved = os.path.realpath(expanded)
+            cd_ok = any(
+                cd_resolved.startswith(d + os.sep) or cd_resolved == d
+                for d in allowed_dirs
+            )
+            if not cd_ok:
+                return None
+            effective_cwd = cd_resolved
+
+        ok, reason = resolve_and_check_paths(path_args, effective_cwd, allowed_dirs)
+        if not ok:
+            return None
+        verified_names.append(cmd_name)
+
+    if not verified_names:
+        return None
+
+    names = ", ".join(sorted(set(verified_names)))
+    return "allow", f"Scoped approve: {names} with all paths in project"
+
+
+def check_docker_scoped(command, config):
+    """Auto-approve docker rm/rmi when targeting specific containers by name.
+
+    Falls through to ask when shell expansion (``$(...)``, ``$VAR``,
+    backticks) is detected — prevents ``docker rm $(docker ps -aq)`` style
+    shotgun removal that could nuke another agent's containers.
+
+    Verifies ALL docker commands in a compound chain.  If any uses shell
+    expansion, the whole command falls through to ask.  Also rejects if
+    other unrelated ask keywords appear in the chain.
+    """
+    rules = config.get("rules", {})
+    docker_scoped = rules.get("docker_scoped", {})
+    docker_keywords = docker_scoped.get("keywords", [])
+    if not docker_keywords:
+        return None
+
+    # Normalize same as decide()
+    normalized = command
+    for safe in rules.get("safe_substrings", []):
+        normalized = normalized.replace(safe, "")
+    normalized = _strip_quoted_contents(normalized)
+    normalized = _strip_comments(normalized)
+    norm_lower = normalized.lower()
+
+    matched = [kw for kw in docker_keywords if kw.lower() in norm_lower]
+    if not matched:
+        return None
+
+    commands = _parse_commands(command)
+    if commands is None:
+        return None
+
+    # Extract subcommand names from matched keywords (e.g. "docker rm" → "rm")
+    matched_subs = set()
+    for kw in matched:
+        parts = kw.strip().lower().split()
+        if len(parts) >= 2:
+            matched_subs.add(parts[1])
+
+    # Reject if any command in the chain matches ask keywords not covered
+    # by docker_scoped.  Uses AST-level check so "rm " inside "docker rm"
+    # doesn't false-positive, but standalone "rm file" or uncovered docker
+    # commands like "docker system prune" are caught.
+    ask_keywords = rules.get("ask", {}).get("keywords", [])
+    docker_kw_lower = {kw.lower() for kw in docker_keywords}
+    for cmd in commands:
+        if cmd["is_privileged"]:
+            continue
+        raw_lower = " ".join(w.lower() for w in cmd["raw_words"])
+        is_docker = cmd["name"].lower() == "docker"
+        for kw in ask_keywords:
+            kw_lower = kw.lower()
+            if kw_lower in docker_kw_lower:
+                continue  # Handled by this docker_scoped check
+            # For docker commands, only match docker-prefixed ask keywords
+            # (e.g. "docker system prune"), skip bare ones like "rm " that
+            # would false-positive on the docker subcommand name.
+            if is_docker and not kw_lower.startswith("docker "):
+                continue
+            if kw_lower in raw_lower:
+                return None
+
+    # Verify ALL docker commands with matching subcommands are safe
+    found_any = False
+    for cmd in commands:
+        # sudo/doas docker ... → never auto-approve
+        if cmd["is_privileged"]:
+            if "docker" in (w.lower() for w in cmd["raw_words"]):
+                return None
+            continue
+
+        if cmd["name"].lower() != "docker":
+            continue
+
+        raw_lower = [w.lower() for w in cmd["raw_words"]]
+        has_matched_sub = any(sub in raw_lower for sub in matched_subs)
+        if not has_matched_sub:
+            continue
+
+        found_any = True
+
+        if cmd["is_unsafe"]:
+            return None
+
+    if not found_any:
+        return None
+
+    kw_str = ", ".join(sorted(matched_subs))
+    return "allow", f"Docker scoped approve: docker {kw_str} with literal targets"
 
 
 def decide(tool_name, command, config, cwd=""):
@@ -252,6 +520,14 @@ def decide(tool_name, command, config, cwd=""):
     for safe in rules.get("safe_substrings", []):
         normalized = normalized.replace(safe, "")
 
+    # Strip quoted string contents so keywords inside commit messages,
+    # echo strings, etc. don't trigger false positives.
+    normalized = _strip_quoted_contents(normalized)
+
+    # Strip bash comments (# to end of line) so keywords inside comments
+    # don't trigger false positives.  Must run after quote stripping.
+    normalized = _strip_comments(normalized)
+
     # Deny keywords (highest priority)
     for kw in rules.get("deny", {}).get("keywords", []):
         if kw.lower() in normalized.lower():
@@ -262,6 +538,11 @@ def decide(tool_name, command, config, cwd=""):
         scoped_result = check_scoped_rules(command, cwd, config)
         if scoped_result is not None:
             return scoped_result
+
+    # Docker scoped rules: auto-approve docker rm/rmi with literal targets
+    docker_result = check_docker_scoped(command, config)
+    if docker_result is not None:
+        return docker_result
 
     # Ask keywords (second priority — also catches failed scoped checks)
     for kw in rules.get("ask", {}).get("keywords", []):

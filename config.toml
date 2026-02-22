@@ -43,6 +43,7 @@ keywords = [
     "docker rmi",
     "docker system prune",
     "docker volume rm",
+    "docker container rm",
     "push --force",
     "push -f",
     "push.*main",
@@ -71,6 +72,13 @@ keywords = [
 keywords = ["rm ", "mv ", "rmdir", "unlink "]
 allow_project_dir = true   # auto-detect git root from cwd
 allowed_dirs = []           # additional absolute paths, e.g. ["/tmp/scratch"]
+
+# Docker scoped rules: auto-approve docker rm/rmi when targeting specific
+# containers/images by name (literal arguments only). Falls through to ask
+# when shell expansion ($(...), $VAR, backticks) is detected — prevents
+# one agent from nuking another agent's containers.
+[rules.docker_scoped]
+keywords = ["docker rm", "docker rmi", "docker container rm"]
 
 # Allow keywords (not strictly needed since default is approve, but explicit)
 [rules.allow]
