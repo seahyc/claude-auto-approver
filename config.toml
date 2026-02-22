@@ -71,7 +71,7 @@ keywords = [
 [rules.scoped]
 keywords = ["rm ", "mv ", "rmdir", "unlink "]
 allow_project_dir = true   # auto-detect git root from cwd
-allowed_dirs = []           # additional absolute paths, e.g. ["/tmp/scratch"]
+allowed_dirs = ["/tmp"]     # additional absolute paths where scoped commands are auto-approved
 
 # Docker scoped rules: auto-approve docker rm/rmi when targeting specific
 # containers/images by name (literal arguments only). Falls through to ask
