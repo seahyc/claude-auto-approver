@@ -70,6 +70,22 @@ def find_git_root(cwd):
         current = parent
 
 
+def _strip_heredoc_contents(text):
+    """Replace heredoc bodies with empty markers.
+
+    Matches ``<<EOF...EOF``, ``<<'EOF'...EOF``, ``<<"EOF"...EOF`` and
+    common variants (HEREDOC, END, MSG, etc.).  The delimiter and body
+    are replaced so keywords inside commit messages, PR descriptions,
+    etc. don't trigger false positives.
+    """
+    return re.sub(
+        r"<<-?\s*['\"]?(\w+)['\"]?\s*\n.*?\n\s*\1",
+        "<<STRIPPED_HEREDOC",
+        text,
+        flags=re.DOTALL,
+    )
+
+
 def _strip_quoted_contents(text):
     """Replace contents of quoted strings with empty markers.
 
@@ -77,6 +93,7 @@ def _strip_quoted_contents(text):
     triggering false positives.  The actual command tokens outside quotes
     are preserved.
     """
+    text = _strip_heredoc_contents(text)
     text = re.sub(r'"[^"]*"', '""', text)
     text = re.sub(r"'[^']*'", "''", text)
     return text
@@ -616,17 +633,21 @@ def decide(tool_name, command, config, cwd=""):
             return normalize(tool_cfg["default_action"]), f"Tool default for {tool_name}"
         return normalize(default), f"Skipped keyword check for {tool_name}"
 
+    # Strip heredoc bodies before any line splitting so keywords inside
+    # commit messages, PR descriptions, etc. don't leak into per-line checks.
+    command_stripped = _strip_heredoc_contents(command)
+
     # Check if command is multiline (after joining continuations)
-    joined = command.replace("\\\n", "")
+    joined = command_stripped.replace("\\\n", "")
     if "\n" not in joined:
         # Single-line: evaluate directly (existing behavior, zero overhead)
-        action, reason = _decide_single(command, config, cwd=cwd)
+        action, reason = _decide_single(command_stripped, config, cwd=cwd)
         if action is not None:
             return action, reason
     else:
         # Multiline: split into logical lines, evaluate each independently,
         # return the most restrictive result (deny > ask > allow)
-        lines = _split_multiline(command)
+        lines = _split_multiline(command_stripped)
         if not lines:
             # All lines were blank/comments - fall through to defaults
             pass
