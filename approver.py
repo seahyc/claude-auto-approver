@@ -7,7 +7,12 @@ import os
 import re
 import datetime
 
-import bashlex
+try:
+    import bashlex
+    HAS_BASHLEX = True
+except ImportError:
+    bashlex = None
+    HAS_BASHLEX = False
 
 try:
     import tomllib
@@ -34,6 +39,12 @@ def extract_command(tool_name, tool_input):
     return str(tool_input)
 
 
+# Tools where keyword matching actually applies (i.e. tools that execute
+# commands).  All other tools skip keyword checks and use per-tool or global
+# defaults — prevents false positives like "form" matching "rm " in WebSearch.
+KEYWORD_MATCH_TOOLS = {"Bash"}
+
+# Legacy skip set kept for backward-compat in case anything references it.
 SKIP_KEYWORD_CHECK = {"ExitPlanMode", "EnterPlanMode", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "AskUserQuestion"}
 
 # Privilege-escalation prefixes — never auto-approve these via scoped rules.
@@ -79,6 +90,17 @@ def _strip_comments(text):
     don't get misidentified as comment starts.
     """
     return re.sub(r"#[^\n]*", "", text)
+
+
+def _keyword_match(keyword, text):
+    """Check if keyword appears in text at a word boundary.
+
+    Uses ``(?<!\\w)`` (not preceded by a word character) so that ``rm ``
+    matches standalone ``rm -f`` but not ``JobRequiredForm -name``.
+    The trailing content of the keyword is matched literally.
+    """
+    pattern = r"(?<!\w)" + re.escape(keyword)
+    return re.search(pattern, text, re.IGNORECASE) is not None
 
 
 def _glob_dir_prefix(path):
@@ -142,6 +164,8 @@ def _parse_commands(command_str):
         is_privileged:  True if first word is sudo/doas
         raw_words:      All word values including flags (for sudo inspection)
     """
+    if not HAS_BASHLEX:
+        return None
     try:
         parts = bashlex.parse(command_str)
     except Exception:
@@ -342,7 +366,7 @@ def check_scoped_rules(command, cwd, config):
     norm_lower = normalized.lower()
 
     # Check if ANY scoped keyword matches
-    matched_scoped = [kw for kw in scoped_keywords if kw.lower() in norm_lower]
+    matched_scoped = [kw for kw in scoped_keywords if _keyword_match(kw, normalized)]
     if not matched_scoped:
         return None
 
@@ -351,7 +375,7 @@ def check_scoped_rules(command, cwd, config):
     ask_keywords = rules.get("ask", {}).get("keywords", [])
     scoped_set = {kw.lower() for kw in scoped_keywords}
     for kw in ask_keywords:
-        if kw.lower() not in scoped_set and kw.lower() in norm_lower:
+        if kw.lower() not in scoped_set and _keyword_match(kw, normalized):
             return None
 
     allowed_dirs = build_allowed_dirs(cwd, scoped)
@@ -439,7 +463,7 @@ def check_docker_scoped(command, config):
     normalized = _strip_comments(normalized)
     norm_lower = normalized.lower()
 
-    matched = [kw for kw in docker_keywords if kw.lower() in norm_lower]
+    matched = [kw for kw in docker_keywords if _keyword_match(kw, normalized)]
     if not matched:
         return None
 
@@ -506,13 +530,13 @@ def check_docker_scoped(command, config):
     return "allow", f"Docker scoped approve: docker {kw_str} with literal targets"
 
 
-def decide(tool_name, command, config, cwd=""):
-    rules = config.get("rules", {})
-    default = rules.get("default_action", "approve")
+def _decide_single(command, config, cwd=""):
+    """Evaluate a single logical command line through the full rule pipeline.
 
-    # Skip keyword matching for non-dangerous tools (includes plan mode)
-    if tool_name in SKIP_KEYWORD_CHECK or "Plan" in tool_name:
-        return normalize(default), f"Skipped keyword check for {tool_name}"
+    Returns (action, reason) tuple.  This is the core keyword-matching logic
+    extracted from decide() so it can be applied per-line for multiline inputs.
+    """
+    rules = config.get("rules", {})
 
     # Strip safe substrings before keyword matching so they don't
     # false-positive on dangerous keywords (e.g. "--rm" triggering "rm ")
@@ -530,7 +554,7 @@ def decide(tool_name, command, config, cwd=""):
 
     # Deny keywords (highest priority)
     for kw in rules.get("deny", {}).get("keywords", []):
-        if kw.lower() in normalized.lower():
+        if _keyword_match(kw, normalized):
             return "deny", f"Matched deny keyword: {kw}"
 
     # Scoped rules: auto-approve dangerous commands when all paths are in-project
@@ -544,15 +568,84 @@ def decide(tool_name, command, config, cwd=""):
     if docker_result is not None:
         return docker_result
 
-    # Ask keywords (second priority — also catches failed scoped checks)
+    # Ask keywords (second priority - also catches failed scoped checks)
     for kw in rules.get("ask", {}).get("keywords", []):
-        if kw.lower() in normalized.lower():
+        if _keyword_match(kw, normalized):
             return "ask", f"Matched ask keyword: {kw}"
 
     # Allow keywords
     for kw in rules.get("allow", {}).get("keywords", []):
-        if kw.lower() in command.lower():
+        if _keyword_match(kw, command):
             return "allow", f"Matched allow keyword: {kw}"
+
+    return None, None
+
+
+# Priority ranking for combining per-line results (higher = more restrictive)
+_ACTION_PRIORITY = {"allow": 0, "ask": 1, "deny": 2}
+
+
+def _split_multiline(command):
+    """Split a multiline command into individual logical lines.
+
+    Joins line continuations (backslash + newline) first, then splits on
+    remaining newlines.  Skips blank lines and comment-only lines.
+    """
+    # Join line continuations into single logical lines
+    joined = command.replace("\\\n", "")
+    lines = joined.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        result.append(stripped)
+    return result
+
+
+def decide(tool_name, command, config, cwd=""):
+    rules = config.get("rules", {})
+    default = rules.get("default_action", "approve")
+
+    # Only run keyword matching on tools that actually execute commands.
+    # Other tools (WebSearch, Read, Grep, ToolSearch, etc.) skip to per-tool
+    # or global default — prevents "form" matching "rm " and similar noise.
+    if tool_name not in KEYWORD_MATCH_TOOLS:
+        tool_cfg = config.get("tools", {}).get(tool_name, {})
+        if "default_action" in tool_cfg:
+            return normalize(tool_cfg["default_action"]), f"Tool default for {tool_name}"
+        return normalize(default), f"Skipped keyword check for {tool_name}"
+
+    # Check if command is multiline (after joining continuations)
+    joined = command.replace("\\\n", "")
+    if "\n" not in joined:
+        # Single-line: evaluate directly (existing behavior, zero overhead)
+        action, reason = _decide_single(command, config, cwd=cwd)
+        if action is not None:
+            return action, reason
+    else:
+        # Multiline: split into logical lines, evaluate each independently,
+        # return the most restrictive result (deny > ask > allow)
+        lines = _split_multiline(command)
+        if not lines:
+            # All lines were blank/comments - fall through to defaults
+            pass
+        else:
+            worst_action = None
+            worst_reason = None
+            worst_priority = -1
+            for line in lines:
+                action, reason = _decide_single(line, config, cwd=cwd)
+                if action is not None:
+                    p = _ACTION_PRIORITY.get(action, 1)
+                    if p > worst_priority:
+                        worst_priority = p
+                        worst_action = action
+                        worst_reason = reason
+                    if action == "deny":
+                        return worst_action, worst_reason
+            if worst_action is not None:
+                return worst_action, worst_reason
 
     # Per-tool override
     tool_cfg = config.get("tools", {}).get(tool_name, {})

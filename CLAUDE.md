@@ -27,7 +27,7 @@ Registered as a `PreToolUse` hook in `~/.claude/settings.json`. Every tool call 
 - `rules.docker_scoped.keywords` — docker commands (e.g. `docker rm`, `docker rmi`) auto-approved when targeting specific containers/images by name, but fall through to `ask` when using shell expansion (`$(...)`, `$VAR`, backticks)
 - `tools.<ToolName>.default_action` — per-tool override
 
-Non-dangerous tools (`ExitPlanMode`, `EnterPlanMode`, `TaskCreate`, etc.) skip keyword matching entirely.
+Keyword matching only applies to `Bash` tool calls (the `KEYWORD_MATCH_TOOLS` set). All other tools (WebSearch, Read, Grep, ToolSearch, etc.) skip keyword checks and use per-tool or global defaults - this prevents false positives like "form" matching "rm " in search queries.
 
 ### Scoped rules
 
