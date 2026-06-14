@@ -755,11 +755,33 @@ def _split_multiline(command):
     """Split a multiline command into individual logical lines.
 
     Joins line continuations (backslash + newline) first, then splits on
-    remaining newlines.  Skips blank lines and comment-only lines.
+    remaining newlines that are **outside** quoted strings.  A newline inside
+    a quoted string (e.g. a multi-line ``git commit -m "..."`` message) is
+    kept on the same logical line so later quote-stripping can remove its
+    contents — otherwise keywords inside the message leak out per-line.
+    Skips blank lines and comment-only lines.
     """
     # Join line continuations into single logical lines
     joined = command.replace("\\\n", "")
-    lines = joined.split("\n")
+
+    lines = []
+    cur = []
+    in_single = False
+    in_double = False
+    for ch in joined:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            cur.append(ch)
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+            cur.append(ch)
+        elif ch == "\n" and not in_single and not in_double:
+            lines.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    lines.append("".join(cur))
+
     result = []
     for line in lines:
         stripped = line.strip()

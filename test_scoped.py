@@ -1341,6 +1341,28 @@ class TestDecideWithScopedRules(unittest.TestCase):
         )
         self.assertEqual(action, "allow")
 
+    def test_multiline_commit_message_with_rm_does_not_trigger(self):
+        """A multi-line quoted commit message must not leak 'rm ' per-line."""
+        cmd = (
+            'git commit -m "Add glob support\n\n'
+            "Approve rm *.log in the project root and rm /tmp/x* since the\n"
+            'glob only matches files inside the dir." && echo "done"'
+        )
+        action, reason = decide("Bash", cmd, self.config, cwd=self.project)
+        self.assertEqual(action, "allow")
+
+    def test_multiline_single_quoted_message_does_not_trigger(self):
+        """Same, but with a single-quoted multi-line message."""
+        cmd = "git commit -m 'cleanup notes\nmentions rm and mv across lines'"
+        action, reason = decide("Bash", cmd, self.config, cwd=self.project)
+        self.assertEqual(action, "allow")
+
+    def test_real_rm_on_own_line_still_caught(self):
+        """A genuine rm on its own line (outside quotes) must not auto-approve."""
+        cmd = "echo start\nrm /etc/passwd\necho done"
+        action, reason = decide("Bash", cmd, self.config, cwd=self.project)
+        self.assertNotEqual(action, "allow")
+
     def test_real_rm_before_commit_still_caught(self):
         action, reason = decide(
             "Bash",
