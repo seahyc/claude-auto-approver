@@ -255,10 +255,34 @@ def _looks_like_description(line):
     return False
 
 
+def _looks_truncated(cmd_physical_lines, all_lines):
+    """Heuristic: is the screen-scraped command likely incomplete?
+
+    We auto-press "Yes", so deciding on a partial command is dangerous (a
+    dangerous tail like ``&& rm -rf /`` could be off-screen or wrapped away).
+    Bail when we can't be confident the full command was captured:
+
+    * an ellipsis (Claude Code truncates long text with ``…``/``...``)
+    * a command line that reaches the apparent pane width (it wrapped, so a
+      token may be split or a continuation may be missing)
+    """
+    joined = "\n".join(cmd_physical_lines)
+    if "…" in joined or "..." in joined:
+        return True
+    # Apparent pane width = widest line in the captured buffer.
+    pane_width = max((len(l) for l in all_lines), default=0)
+    if pane_width >= 4:
+        for line in cmd_physical_lines:
+            if len(line) >= pane_width - 1:
+                return True
+    return False
+
+
 def parse_prompt(content):
     """Parse terminal content for a Claude Code permission prompt.
 
-    Returns a dict with {tool, command} if a prompt is found, or None.
+    Returns a dict with {tool, command, truncated} if a prompt is found,
+    or None.
     """
     text = strip_ansi(content)
     lines = text.split("\n")
@@ -327,6 +351,7 @@ def parse_prompt(content):
     # lines that look like natural-language descriptions (no shell metacharacters,
     # starts with a capital letter and reads like prose).
     cmd_lines = []
+    raw_cmd_lines = []
     in_command = False
 
     for i in range(header_idx + 1, proceed_idx):
@@ -349,13 +374,15 @@ def parse_prompt(content):
             if in_command and _looks_like_description(stripped):
                 break
             cmd_lines.append(stripped)
+            raw_cmd_lines.append(line)
             in_command = True
 
     if not cmd_lines:
         return None
 
     command = "\n".join(cmd_lines)
-    return {"tool": tool_name, "command": command}
+    truncated = _looks_truncated(raw_cmd_lines, lines)
+    return {"tool": tool_name, "command": command, "truncated": truncated}
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +507,18 @@ def main():
                         tool=prompt["tool"], command=prompt["command"],
                         action="skip", reason=f"Non-Bash tool: {prompt['tool']}",
                     )
+                    continue
+
+                # Never auto-approve a command we may not have captured in full
+                # (wrapped/truncated on screen) — a hidden tail could be unsafe.
+                if prompt.get("truncated"):
+                    seen[key] = time.time()
+                    log_event(
+                        source="scanner", tty=tty,
+                        tool=prompt["tool"], command=prompt["command"],
+                        action="skip", reason="Command may be truncated/wrapped on screen",
+                    )
+                    print(f"[{datetime.datetime.now():%H:%M:%S}] SKIP(truncated) {tty}: {prompt['command'][:80]}")
                     continue
 
                 action, reason = decide("Bash", prompt["command"], config, cwd="")
