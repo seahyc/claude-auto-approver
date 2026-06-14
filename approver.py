@@ -547,6 +547,124 @@ def check_docker_scoped(command, config):
     return "allow", f"Docker scoped approve: docker {kw_str} with literal targets"
 
 
+def check_kubectl_scoped(command, config):
+    """Context-aware kubectl/helm/helmfile access control.
+
+    Auto-approves write operations on non-production contexts, prompts for
+    production writes.  Read operations return None (fall through to native
+    permissions which auto-approve them).
+
+    Detection order:
+    1. Identify tool: kubectl, rancher kubectl, helm, or helmfile
+    2. Extract subcommand: first non-flag positional arg after tool name
+    3. Detect context: --context/--kube-context flag, or kubectl config current-context
+    4. Decide: non-prod write → allow, prod write → ask, read → None (fall through)
+    """
+    rules = config.get("rules", {})
+    kubectl_scoped = rules.get("kubectl_scoped", {})
+    if not kubectl_scoped:
+        return None
+
+    prod_contexts = set(kubectl_scoped.get("production_contexts", []))
+    kubectl_writes = set(kubectl_scoped.get("kubectl_write_subcommands", []))
+    helm_writes = set(kubectl_scoped.get("helm_write_subcommands", []))
+    helmfile_writes = set(kubectl_scoped.get("helmfile_write_subcommands", []))
+
+    # Tokenize command simply (split on whitespace)
+    tokens = command.split()
+    if not tokens:
+        return None
+
+    # Detect tool and determine write subcommands + context flag name
+    tool = None
+    tool_end_idx = 0  # index after tool name tokens
+    write_subcmds = None
+    context_flag = None
+
+    if tokens[0] == "rancher" and len(tokens) > 1 and tokens[1] == "kubectl":
+        tool = "rancher kubectl"
+        tool_end_idx = 2
+        write_subcmds = kubectl_writes
+        context_flag = "--context"
+    elif tokens[0] == "kubectl":
+        tool = "kubectl"
+        tool_end_idx = 1
+        write_subcmds = kubectl_writes
+        context_flag = "--context"
+    elif tokens[0] == "helm":
+        tool = "helm"
+        tool_end_idx = 1
+        write_subcmds = helm_writes
+        context_flag = "--kube-context"
+    elif tokens[0] == "helmfile":
+        tool = "helmfile"
+        tool_end_idx = 1
+        write_subcmds = helmfile_writes
+        context_flag = "--kube-context"
+    else:
+        return None
+
+    # Extract subcommand and context: parse tokens after tool name,
+    # handling --flag value pairs properly
+    subcommand = None
+    context = None
+    skip_next = False
+    for i, t in enumerate(tokens[tool_end_idx:], start=tool_end_idx):
+        if skip_next:
+            skip_next = False
+            continue
+        if t == context_flag and i + 1 < len(tokens):
+            context = tokens[i + 1]
+            skip_next = True
+            continue
+        if t.startswith(context_flag + "="):
+            context = t.split("=", 1)[1]
+            continue
+        # Skip other flags with known value arguments
+        if t in ("--namespace", "-n", "--kubeconfig", "--server", "-s",
+                 "--token", "--user", "--cluster", "--certificate-authority",
+                 "--client-certificate", "--client-key", "-o", "--output",
+                 "-l", "--selector", "-f", "--filename", "--timeout",
+                 "--sort-by", "--field-selector"):
+            skip_next = True
+            continue
+        if t.startswith("-"):
+            # Unknown flag — if it uses = syntax, skip it; otherwise
+            # assume it's a boolean flag
+            continue
+        if subcommand is None:
+            subcommand = t
+
+    if subcommand is None:
+        return None
+
+    # Only act on write subcommands; reads fall through to native permissions
+    if subcommand not in write_subcmds:
+        return None
+
+    # Fallback: get current context from kubectl
+    if context is None:
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["/usr/local/bin/kubectl", "config", "current-context"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                context = result.stdout.strip()
+        except Exception:
+            pass
+
+    if context is None:
+        # Can't determine context — be safe, prompt
+        return "ask", f"Write operation ({tool} {subcommand}) but context unknown"
+
+    if context in prod_contexts:
+        return "ask", f"Write operation on PRODUCTION: {tool} {subcommand} (context: {context})"
+    else:
+        return "allow", f"Write on non-production context: {tool} {subcommand} (context: {context})"
+
+
 def _decide_single(command, config, cwd=""):
     """Evaluate a single logical command line through the full rule pipeline.
 
@@ -573,6 +691,11 @@ def _decide_single(command, config, cwd=""):
     for kw in rules.get("deny", {}).get("keywords", []):
         if _keyword_match(kw, normalized):
             return "deny", f"Matched deny keyword: {kw}"
+
+    # kubectl/helm/helmfile context-aware scoped rules (before generic ask keywords)
+    kubectl_result = check_kubectl_scoped(command, config)
+    if kubectl_result is not None:
+        return kubectl_result
 
     # Scoped rules: auto-approve dangerous commands when all paths are in-project
     if cwd:

@@ -16,29 +16,6 @@ keywords = [
     "mv ",
     "rmdir",
     "unlink ",
-    "rancher",
-    "kubectl apply",
-    "kubectl delete",
-    "kubectl create",
-    "kubectl patch",
-    "kubectl replace",
-    "kubectl edit",
-    "kubectl scale",
-    "kubectl autoscale",
-    "kubectl rollout",
-    "kubectl expose",
-    "kubectl run",
-    "kubectl set",
-    "kubectl cordon",
-    "kubectl uncordon",
-    "kubectl drain",
-    "kubectl taint",
-    "kubectl label",
-    "kubectl annotate",
-    "kubectl exec",
-    "kubectl cp",
-    "kubectl debug",
-    "kubectl config",
     "docker rm",
     "docker rmi",
     "docker system prune",
@@ -79,6 +56,20 @@ allowed_dirs = ["/tmp"]     # additional absolute paths where scoped commands ar
 # one agent from nuking another agent's containers.
 [rules.docker_scoped]
 keywords = ["docker rm", "docker rmi", "docker container rm"]
+
+# Context-aware kubectl/helm/helmfile scoped rules: auto-approve writes on
+# non-production contexts, prompt for production writes. Read ops fall through
+# to native permissions (which auto-approve them).
+[rules.kubectl_scoped]
+production_contexts = ["alicloud-production"]
+kubectl_write_subcommands = [
+    "apply", "create", "delete", "edit", "patch", "replace",
+    "run", "scale", "autoscale", "rollout", "expose", "set",
+    "cordon", "uncordon", "drain", "taint", "label", "annotate",
+    "cp", "debug",
+]
+helm_write_subcommands = ["install", "upgrade", "uninstall", "rollback", "delete"]
+helmfile_write_subcommands = ["apply", "sync", "destroy", "delete"]
 
 # Allow keywords (not strictly needed since default is approve, but explicit)
 [rules.allow]
