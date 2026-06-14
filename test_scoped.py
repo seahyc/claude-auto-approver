@@ -796,9 +796,11 @@ class TestCheckScopedRules(unittest.TestCase):
         result = check_scoped_rules("rm ../../etc/passwd", self.project, self.config)
         self.assertIsNone(result)
 
-    def test_metacharacter_returns_none(self):
+    def test_glob_at_allowed_root_approved(self):
+        """rm *.pyc — glob dir '.' equals project root; glob matches files inside it."""
         result = check_scoped_rules("rm *.pyc", self.project, self.config)
-        self.assertIsNone(result)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "allow")
 
     def test_command_substitution_returns_none(self):
         result = check_scoped_rules("rm $(cat list)", self.project, self.config)
@@ -969,11 +971,13 @@ class TestCheckScopedRules(unittest.TestCase):
         result = check_scoped_rules(cmd, self.project, self.config)
         self.assertIsNone(result)
 
-    def test_glob_in_segment_returns_none(self):
+    def test_glob_in_segment_approved(self):
+        """rm *.pyc at root in a chain — glob dir equals project root, approved."""
         result = check_scoped_rules(
             "rm *.pyc && echo done", self.project, self.config
         )
-        self.assertIsNone(result)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "allow")
 
     def test_rm_with_redirect_in_project(self):
         result = check_scoped_rules(
@@ -1047,14 +1051,56 @@ class TestCheckScopedRules(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result[0], "allow")
 
-    def test_glob_at_project_root_returns_none(self):
-        """rm *.pyc at project root — '.' resolves to root, which is not strictly inside."""
+    def test_glob_at_project_root_approved(self):
+        """rm *.pyc at project root — '.' resolves to root; glob matches files inside it."""
         result = check_scoped_rules("rm *.pyc", self.project, self.config)
-        self.assertIsNone(result)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "allow")
 
     def test_glob_outside_project_returns_none(self):
         """rm /tmp/*.txt — glob directory is outside project."""
         result = check_scoped_rules("rm /tmp/*.txt", self.project, self.config)
+        self.assertIsNone(result)
+
+    def test_bare_glob_at_root_approved(self):
+        """rm * at project root — glob dir is the root itself; approved (files inside)."""
+        result = check_scoped_rules("rm -f *", self.project, self.config)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "allow")
+
+    def test_glob_at_extra_allowed_dir_root_approved(self):
+        """rm <allowed>/x* where the glob dir equals an extra allowed_dir (e.g. /tmp)."""
+        extra = os.path.join(self.tmpdir, "scratch")
+        os.makedirs(extra)
+        config = {
+            "rules": {
+                "safe_substrings": ["--rm"],
+                "scoped": {
+                    "keywords": ["rm ", "mv ", "rmdir", "unlink "],
+                    "allow_project_dir": True,
+                    "allowed_dirs": [extra],
+                },
+            }
+        }
+        result = check_scoped_rules(f"rm -f {extra}/x*", self.project, config)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "allow")
+
+    def test_literal_allowed_dir_root_still_asks(self):
+        """rm <allowed-dir> (no glob) deleting the dir itself still falls through."""
+        extra = os.path.join(self.tmpdir, "scratch")
+        os.makedirs(extra)
+        config = {
+            "rules": {
+                "safe_substrings": ["--rm"],
+                "scoped": {
+                    "keywords": ["rm ", "mv ", "rmdir", "unlink "],
+                    "allow_project_dir": True,
+                    "allowed_dirs": [extra],
+                },
+            }
+        }
+        result = check_scoped_rules(f"rm -rf {extra}", self.project, config)
         self.assertIsNone(result)
 
     def test_mv_glob_both_in_project(self):
@@ -1130,12 +1176,12 @@ class TestDecideWithScopedRules(unittest.TestCase):
         self.assertEqual(action, "ask")
         self.assertIn("ask keyword", reason)
 
-    def test_metachar_falls_through_to_ask(self):
+    def test_glob_at_root_approved(self):
         action, reason = decide(
             "Bash", "rm *.pyc", self.config, cwd=self.project
         )
-        self.assertEqual(action, "ask")
-        self.assertIn("ask keyword", reason)
+        self.assertEqual(action, "allow")
+        self.assertIn("Scoped approve", reason)
 
     def test_sudo_falls_through_to_ask(self):
         action, reason = decide(
@@ -1219,15 +1265,15 @@ class TestDecideWithScopedRules(unittest.TestCase):
         )
         self.assertEqual(action, "ask")
 
-    def test_rm_glob_at_root_asks(self):
-        """rm *.pyc at project root still asks (root not strictly inside)."""
+    def test_rm_glob_at_root_approved(self):
+        """rm *.pyc at project root is approved (glob matches files inside root)."""
         action, reason = decide(
             "Bash",
             "rm *.pyc && echo cleaned",
             self.config,
             cwd=self.project,
         )
-        self.assertEqual(action, "ask")
+        self.assertEqual(action, "allow")
 
     def test_rm_glob_in_subdir_approved(self):
         """rm build/*.o — glob in project subdir is approved."""

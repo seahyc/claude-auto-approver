@@ -58,6 +58,19 @@ _UNKNOWN_CD = object()
 GLOB_CHARS = set("*?[]{}")
 
 
+class GlobDir(str):
+    """A path that is the *directory* containing a glob pattern.
+
+    Behaves exactly like a ``str`` everywhere, but carries a flag so the
+    containment check knows this represents files *inside* the directory
+    (e.g. ``/tmp/x*`` → ``/tmp``).  Unlike a literal path, a glob's
+    directory is allowed to *equal* an allowed dir — the glob can only ever
+    match files within it, never the directory itself.
+    """
+
+    is_glob_dir = True
+
+
 def find_git_root(cwd):
     """Walk up from cwd to find the nearest .git directory (project root)."""
     current = os.path.realpath(cwd)
@@ -140,10 +153,10 @@ def _glob_dir_prefix(path):
             prefix = path[:i]
             last_sep = prefix.rfind("/")
             if last_sep > 0:
-                return prefix[:last_sep]
+                return GlobDir(prefix[:last_sep])
             if last_sep == 0:
-                return "/"
-            return "."
+                return GlobDir("/")
+            return GlobDir(".")
     return path
 
 
@@ -325,12 +338,17 @@ def resolve_and_check_paths(paths, cwd, allowed_dirs):
             expanded = os.path.join(cwd, expanded)
         resolved = os.path.realpath(expanded)
 
+        # A glob's directory prefix represents files *inside* that directory,
+        # so it may equal an allowed dir.  A literal path must be strictly
+        # inside (equality would mean deleting the dir itself → ask).
+        is_glob_dir = getattr(raw_path, "is_glob_dir", False)
+
         contained = False
         for allowed in allowed_dirs:
             allowed_real = os.path.realpath(allowed)
-            # Strict subdirectory check — the path must be *inside* the dir,
-            # not equal to it (prevents deleting the project root itself).
-            if resolved.startswith(allowed_real + os.sep):
+            if resolved.startswith(allowed_real + os.sep) or (
+                is_glob_dir and resolved == allowed_real
+            ):
                 contained = True
                 break
 
