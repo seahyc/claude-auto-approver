@@ -13,6 +13,7 @@ from approver import (
     _word_is_unsafe,
     build_allowed_dirs,
     check_docker_scoped,
+    check_kubectl_scoped,
     check_scoped_rules,
     decide,
     extract_path_args,
@@ -1773,6 +1774,88 @@ class TestDecideWithDockerScoped(unittest.TestCase):
         )
         self.assertEqual(action, "allow")
         self.assertIn("Global default", reason)
+
+
+class TestCheckKubectlScoped(unittest.TestCase):
+    """Context-aware kubectl/helm/helmfile prod-guard."""
+
+    def setUp(self):
+        self.config = {
+            "rules": {
+                "kubectl_scoped": {
+                    "production_contexts": ["alicloud-production", "prod", "production"],
+                    "kubectl_write_subcommands": [
+                        "apply", "create", "delete", "edit", "patch",
+                        "replace", "scale", "rollout",
+                    ],
+                    "helm_write_subcommands": ["install", "upgrade", "uninstall"],
+                    "helmfile_write_subcommands": ["apply", "sync", "destroy", "delete"],
+                }
+            }
+        }
+
+    def _act(self, command):
+        r = check_kubectl_scoped(command, self.config)
+        return r[0] if r else None
+
+    # --- production writes must ask ---
+
+    def test_kubectl_delete_prod_asks(self):
+        self.assertEqual(
+            self._act("kubectl delete ns foo --context alicloud-production"), "ask"
+        )
+
+    def test_helmfile_env_value_not_mistaken_for_subcommand(self):
+        # -e production must be consumed; apply detected; prod env → ask.
+        self.assertEqual(self._act("helmfile -e production apply"), "ask")
+
+    def test_helmfile_destroy_prod_asks(self):
+        self.assertEqual(self._act("helmfile -e prod destroy"), "ask")
+
+    def test_compound_use_context_then_write_asks(self):
+        self.assertEqual(
+            self._act(
+                "kubectl config use-context alicloud-production && kubectl delete ns foo"
+            ),
+            "ask",
+        )
+
+    def test_env_prefixed_write_asks(self):
+        self.assertEqual(
+            self._act("FOO=bar kubectl delete ns foo --context alicloud-production"),
+            "ask",
+        )
+
+    def test_xargs_write_asks(self):
+        self.assertEqual(
+            self._act("echo foo | xargs kubectl delete ns --context alicloud-production"),
+            "ask",
+        )
+
+    def test_context_unknown_write_asks(self):
+        # No explicit context and helmfile has no kube fallback → unknown → ask.
+        self.assertEqual(self._act("helmfile -e staging-x apply --kube-context "), "ask")
+
+    # --- non-production writes auto-allow ---
+
+    def test_nonprod_write_allows(self):
+        self.assertEqual(
+            self._act("kubectl apply -f x.yaml --context dev-cluster"), "allow"
+        )
+
+    def test_nonprod_delete_allows(self):
+        self.assertEqual(self._act("kubectl delete pod p --context staging"), "allow")
+
+    # --- reads / non-tools fall through (None) ---
+
+    def test_read_falls_through(self):
+        self.assertIsNone(self._act("kubectl get pods --context alicloud-production"))
+
+    def test_non_kubectl_falls_through(self):
+        self.assertIsNone(self._act("echo kubectl delete"))
+
+    def test_no_kubectl_config_section_returns_none(self):
+        self.assertIsNone(check_kubectl_scoped("kubectl delete ns foo", {"rules": {}}))
 
 
 if __name__ == "__main__":

@@ -573,6 +573,56 @@ def check_docker_scoped(command, config):
     return "allow", f"Docker scoped approve: docker {kw_str} with literal targets"
 
 
+# Tokens that separate one simple command from the next in a chain.
+_CMD_SEPARATORS = {"&&", "||", ";", "|", "&", "(", ")"}
+
+# Flags (other than the context flag) that take a value argument, so the
+# following token must be skipped when hunting for the subcommand.  Includes
+# helmfile's -e/--environment — without it, "helmfile -e production apply"
+# mistakes "production" for the subcommand.
+_VALUE_FLAGS = {
+    "--namespace", "-n", "--kubeconfig", "--server", "-s",
+    "--token", "--user", "--cluster", "--certificate-authority",
+    "--client-certificate", "--client-key", "-o", "--output",
+    "-l", "--selector", "-f", "--filename", "--timeout",
+    "--sort-by", "--field-selector", "-e", "--environment",
+}
+
+
+def _kubectl_current_context():
+    """Best-effort `kubectl config current-context`, or None."""
+    try:
+        import shutil
+        import subprocess
+        kubectl = shutil.which("kubectl") or "/usr/local/bin/kubectl"
+        result = subprocess.run(
+            [kubectl, "config", "current-context"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def _is_command_position(tokens, i):
+    """True if tokens[i] starts a new simple command.
+
+    Covers the start of the line, the token after a shell separator, after
+    ``xargs``, and after env-assignment prefixes (``FOO=bar kubectl ...``).
+    """
+    if i == 0:
+        return True
+    prev = tokens[i - 1]
+    if prev in _CMD_SEPARATORS or prev == "xargs":
+        return True
+    # Env-assignment prefix (FOO=bar) immediately before the command.
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", prev):
+        return True
+    return False
+
+
 def check_kubectl_scoped(command, config):
     """Context-aware kubectl/helm/helmfile access control.
 
@@ -580,11 +630,12 @@ def check_kubectl_scoped(command, config):
     production writes.  Read operations return None (fall through to native
     permissions which auto-approve them).
 
-    Detection order:
-    1. Identify tool: kubectl, rancher kubectl, helm, or helmfile
-    2. Extract subcommand: first non-flag positional arg after tool name
-    3. Detect context: --context/--kube-context flag, or kubectl config current-context
-    4. Decide: non-prod write → allow, prod write → ask, read → None (fall through)
+    The tool is detected at *any* command position in a chain — not just the
+    first token — so env-prefixed (``FOO=bar kubectl``), chained
+    (``... && kubectl delete``), and ``xargs kubectl`` invocations are all
+    covered.  A ``kubectl config use-context <ctx>`` earlier in the same chain
+    sets the effective context for later writes.  Each write invocation is
+    evaluated; the most restrictive outcome wins (ask > allow).
     """
     rules = config.get("rules", {})
     kubectl_scoped = rules.get("kubectl_scoped", {})
@@ -592,103 +643,121 @@ def check_kubectl_scoped(command, config):
         return None
 
     prod_contexts = set(kubectl_scoped.get("production_contexts", []))
-    kubectl_writes = set(kubectl_scoped.get("kubectl_write_subcommands", []))
-    helm_writes = set(kubectl_scoped.get("helm_write_subcommands", []))
-    helmfile_writes = set(kubectl_scoped.get("helmfile_write_subcommands", []))
+    writes_by_tool = {
+        "kubectl": set(kubectl_scoped.get("kubectl_write_subcommands", [])),
+        "rancher kubectl": set(kubectl_scoped.get("kubectl_write_subcommands", [])),
+        "helm": set(kubectl_scoped.get("helm_write_subcommands", [])),
+        "helmfile": set(kubectl_scoped.get("helmfile_write_subcommands", [])),
+    }
+    # helmfile environments are orthogonal to kube contexts, so we never fall
+    # back to `kubectl current-context` for it — an unconfirmed helmfile write
+    # context stays unknown (→ ask).
+    context_flag_by_tool = {
+        "kubectl": "--context",
+        "rancher kubectl": "--context",
+        "helm": "--kube-context",
+        "helmfile": "--kube-context",
+    }
+    uses_kube_fallback = {"kubectl", "rancher kubectl", "helm"}
 
-    # Tokenize command simply (split on whitespace)
     tokens = command.split()
     if not tokens:
         return None
 
-    # Detect tool and determine write subcommands + context flag name
-    tool = None
-    tool_end_idx = 0  # index after tool name tokens
-    write_subcmds = None
-    context_flag = None
+    # Locate every tool invocation and the token range of its segment.
+    invocations = []  # (tool, start_idx, end_idx)
+    i = 0
+    n = len(tokens)
+    while i < n:
+        if not _is_command_position(tokens, i):
+            i += 1
+            continue
+        tool = None
+        start = i
+        if tokens[i] == "rancher" and i + 1 < n and tokens[i + 1] == "kubectl":
+            tool = "rancher kubectl"
+        elif tokens[i] in ("kubectl", "helm", "helmfile"):
+            tool = tokens[i]
+        if tool is None:
+            i += 1
+            continue
+        # Segment runs until the next separator.
+        end = i + 1
+        while end < n and tokens[end] not in _CMD_SEPARATORS:
+            end += 1
+        invocations.append((tool, start, end))
+        i = end
 
-    if tokens[0] == "rancher" and len(tokens) > 1 and tokens[1] == "kubectl":
-        tool = "rancher kubectl"
-        tool_end_idx = 2
-        write_subcmds = kubectl_writes
-        context_flag = "--context"
-    elif tokens[0] == "kubectl":
-        tool = "kubectl"
-        tool_end_idx = 1
-        write_subcmds = kubectl_writes
-        context_flag = "--context"
-    elif tokens[0] == "helm":
-        tool = "helm"
-        tool_end_idx = 1
-        write_subcmds = helm_writes
-        context_flag = "--kube-context"
-    elif tokens[0] == "helmfile":
-        tool = "helmfile"
-        tool_end_idx = 1
-        write_subcmds = helmfile_writes
-        context_flag = "--kube-context"
-    else:
+    if not invocations:
         return None
 
-    # Extract subcommand and context: parse tokens after tool name,
-    # handling --flag value pairs properly
-    subcommand = None
-    context = None
-    skip_next = False
-    for i, t in enumerate(tokens[tool_end_idx:], start=tool_end_idx):
-        if skip_next:
-            skip_next = False
-            continue
-        if t == context_flag and i + 1 < len(tokens):
-            context = tokens[i + 1]
-            skip_next = True
-            continue
-        if t.startswith(context_flag + "="):
-            context = t.split("=", 1)[1]
-            continue
-        # Skip other flags with known value arguments
-        if t in ("--namespace", "-n", "--kubeconfig", "--server", "-s",
-                 "--token", "--user", "--cluster", "--certificate-authority",
-                 "--client-certificate", "--client-key", "-o", "--output",
-                 "-l", "--selector", "-f", "--filename", "--timeout",
-                 "--sort-by", "--field-selector"):
-            skip_next = True
-            continue
-        if t.startswith("-"):
-            # Unknown flag — if it uses = syntax, skip it; otherwise
-            # assume it's a boolean flag
-            continue
-        if subcommand is None:
-            subcommand = t
+    # A `kubectl config use-context <ctx>` anywhere in the chain sets the
+    # effective context for writes that don't name one explicitly.
+    chain_context = None
+    for tool, start, end in invocations:
+        seg = tokens[start:end]
+        head = 2 if tool == "rancher kubectl" else 1
+        rest = seg[head:]
+        if len(rest) >= 3 and rest[0] == "config" and rest[1] == "use-context":
+            chain_context = rest[2]
 
-    if subcommand is None:
+    def _parse_segment(tool, seg):
+        """Return (subcommand, explicit_context) for one tool segment."""
+        head = 2 if tool == "rancher kubectl" else 1
+        context_flag = context_flag_by_tool[tool]
+        subcommand = None
+        context = None
+        skip_next = False
+        for t in seg[head:]:
+            if skip_next:
+                skip_next = False
+                continue
+            if t == context_flag:
+                skip_next = True
+                continue
+            if t.startswith(context_flag + "="):
+                context = t.split("=", 1)[1]
+                continue
+            if t in _VALUE_FLAGS:
+                skip_next = True
+                continue
+            if t.startswith("-"):
+                continue
+            if subcommand is None:
+                subcommand = t
+        # Re-scan for the context flag's value (separate pass keeps the
+        # subcommand logic simple).
+        for j, t in enumerate(seg[head:]):
+            if t == context_flag and head + j + 1 < len(seg):
+                context = seg[head + j + 1]
+        return subcommand, context
+
+    results = []
+    for tool, start, end in invocations:
+        seg = tokens[start:end]
+        subcommand, context = _parse_segment(tool, seg)
+        if subcommand is None or subcommand not in writes_by_tool[tool]:
+            continue  # read / non-write / use-context itself
+
+        if context is None:
+            context = chain_context
+        if context is None and tool in uses_kube_fallback:
+            context = _kubectl_current_context()
+
+        if context is None:
+            results.append(("ask", f"Write operation ({tool} {subcommand}) but context unknown"))
+        elif context in prod_contexts:
+            results.append(("ask", f"Write operation on PRODUCTION: {tool} {subcommand} (context: {context})"))
+        else:
+            results.append(("allow", f"Write on non-production context: {tool} {subcommand} (context: {context})"))
+
+    if not results:
         return None
-
-    # Only act on write subcommands; reads fall through to native permissions
-    if subcommand not in write_subcmds:
-        return None
-
-    # Fallback: get current context from kubectl
-    if context is None:
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["/usr/local/bin/kubectl", "config", "current-context"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                context = result.stdout.strip()
-        except Exception:
-            pass
-
-    if context is None:
-        # Can't determine context — be safe, prompt
-        return "ask", f"Write operation ({tool} {subcommand}) but context unknown"
-
-    if context in prod_contexts:
-        return "ask", f"Write operation on PRODUCTION: {tool} {subcommand} (context: {context})"
-    else:
-        return "allow", f"Write on non-production context: {tool} {subcommand} (context: {context})"
+    # Most restrictive wins: any ask → ask.
+    for action, reason in results:
+        if action == "ask":
+            return action, reason
+    return results[0]
 
 
 def _decide_single(command, config, cwd=""):
