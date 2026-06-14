@@ -443,23 +443,31 @@ def check_scoped_rules(command, cwd, config):
         if path_args is None:
             return None
 
+        # A preceding cd only affects how *relative* paths resolve.  If every
+        # path arg is absolute, the cd target is irrelevant to this command
+        # (e.g. "cd ~/elsewhere && rm /tmp/x") — don't reject on it.
+        all_absolute = all(
+            os.path.isabs(os.path.expanduser(p)) for p in path_args
+        )
+
         # Determine effective cwd — handle cd preceding the command
         effective_cwd = cwd
         cd = cmd["cd_target"]
-        if cd is _UNKNOWN_CD:
-            return None
-        if cd is not None:
-            expanded = os.path.expanduser(cd)
-            if not os.path.isabs(expanded):
-                expanded = os.path.join(cwd, expanded)
-            cd_resolved = os.path.realpath(expanded)
-            cd_ok = any(
-                cd_resolved.startswith(d + os.sep) or cd_resolved == d
-                for d in allowed_dirs
-            )
-            if not cd_ok:
+        if not all_absolute:
+            if cd is _UNKNOWN_CD:
                 return None
-            effective_cwd = cd_resolved
+            if cd is not None:
+                expanded = os.path.expanduser(cd)
+                if not os.path.isabs(expanded):
+                    expanded = os.path.join(cwd, expanded)
+                cd_resolved = os.path.realpath(expanded)
+                cd_ok = any(
+                    cd_resolved.startswith(d + os.sep) or cd_resolved == d
+                    for d in allowed_dirs
+                )
+                if not cd_ok:
+                    return None
+                effective_cwd = cd_resolved
 
         ok, reason = resolve_and_check_paths(path_args, effective_cwd, allowed_dirs)
         if not ok:

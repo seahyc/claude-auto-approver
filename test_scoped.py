@@ -914,6 +914,40 @@ class TestCheckScopedRules(unittest.TestCase):
         )
         self.assertIsNone(result)
 
+    def test_cd_outside_then_rm_absolute_in_allowed_approved(self):
+        """cd to an outside dir, but rm targets an absolute path in an allowed dir.
+
+        The cd is irrelevant to an absolute target, so it must not block.
+        """
+        scratch = os.path.join(self.tmpdir, "scratch")
+        os.makedirs(scratch)
+        outside = os.path.join(self.tmpdir, "elsewhere")
+        os.makedirs(outside)
+        config = {
+            "rules": {
+                "safe_substrings": ["--rm"],
+                "scoped": {
+                    "keywords": ["rm ", "mv ", "rmdir", "unlink "],
+                    "allow_project_dir": True,
+                    "allowed_dirs": [scratch],
+                },
+            }
+        }
+        result = check_scoped_rules(
+            f"cd {outside} && echo hi; rm -f {scratch}/tool", self.project, config
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "allow")
+
+    def test_cd_outside_then_rm_relative_returns_none(self):
+        """cd outside + rm of a *relative* path must still fall through to ask."""
+        outside = os.path.join(self.tmpdir, "elsewhere")
+        os.makedirs(outside)
+        result = check_scoped_rules(
+            f"cd {outside} && rm file.txt", self.project, self.config
+        )
+        self.assertIsNone(result)
+
     def test_cd_inside_project_then_rm_approved(self):
         """cd to subdir in project + rm relative path → approved."""
         subdir = os.path.join(self.project, "src")
