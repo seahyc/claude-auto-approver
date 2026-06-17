@@ -573,6 +573,107 @@ def check_docker_scoped(command, config):
     return "allow", f"Docker scoped approve: docker {kw_str} with literal targets"
 
 
+# Hostnames that mean "the local machine's postgres" — safe to auto-approve.
+# Empty string covers the no-host case (psql connects via local unix socket).
+PSQL_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0", ""}
+
+# Command words that, when they wrap a psql invocation, mean psql runs on a
+# *different* machine — so even `-h localhost` refers to the remote box.
+# Their presence forces a prompt regardless of the parsed host.
+PSQL_REMOTE_WRAPPERS = ("ssh", "kubectl", "rancher")
+
+# Patterns that surface the target host of a psql connection.  Run against the
+# raw command (hosts usually sit outside quotes, e.g. `-h localhost`, and conn
+# strings may be quoted so we must see inside them).  `-h\s*` covers both
+# `-h host` and the no-space `-hhost` form; the `host=` key tolerates a leading
+# quote (`"host=prod ..."`) but stops at the next quote/space so quoted SQL
+# values like `host='x'` don't match.
+_PSQL_HOST_RES = [
+    re.compile(r"(?:^|\s)-h\s*([^\s]+)"),
+    re.compile(r"(?:^|\s)--host(?:=|\s+)(\S+)"),
+    re.compile(r"postgres(?:ql)?://(?:[^@/\s]*@)?([^:/\s]+)", re.IGNORECASE),
+    re.compile(r"(?<![\w-])host=([^\s\"']+)"),
+    re.compile(r"(?:^|\s)PGHOST=(\S+)"),
+]
+
+# A connection *service* (pg_service.conf) or PGSERVICE resolves the host from
+# an external file we can't read statically — so we can't prove it's local.
+# Treat its presence as remote → prompt.
+_PSQL_SERVICE_RE = re.compile(r"(?<![\w-])(?:service=|PGSERVICE=)", re.IGNORECASE)
+
+
+def _clean_psql_host(h):
+    """Strip surrounding quotes/escapes from a captured host token."""
+    return h.strip().strip("'\"").strip("\\").strip("'\"").strip()
+
+
+def check_psql_scoped(command, config):
+    """Host-aware psql access control.
+
+    Auto-approves psql commands that target the **local** machine's database
+    (``-h localhost``/``127.0.0.1``/``::1``, a unix socket, or no host at all),
+    and prompts (``ask``) when psql targets a remote host or runs on another
+    machine via a remote wrapper (ssh/kubectl/rancher).
+
+    Returns ("allow"|"ask", reason) or None to fall through.  A ``docker exec``
+    that is *not* itself under a remote wrapper is treated as local (a local
+    dev container).  Returns None (defer) when a local psql line also contains
+    an uncovered ask keyword (rm/mv/...), so that command's risk is still
+    surfaced by the normal ask-keyword pass.
+    """
+    rules = config.get("rules", {})
+    psql_cfg = rules.get("psql_scoped", {})
+    if not psql_cfg.get("enabled", False):
+        return None
+
+    # Only engage when psql actually appears as a command word.
+    if not re.search(r"(?<!\w)psql(?!\w)", command, re.IGNORECASE):
+        return None
+
+    local_hosts = {h.lower() for h in psql_cfg.get("local_hosts", [])} | PSQL_LOCAL_HOSTS
+    wrappers = tuple(psql_cfg.get("remote_wrappers", PSQL_REMOTE_WRAPPERS))
+
+    # A remote wrapper means psql executes on another machine — even
+    # `-h localhost` is that machine's localhost.  Always prompt.
+    tokens = command.split()
+    for i, t in enumerate(tokens):
+        if t in wrappers and _is_command_position(tokens, i):
+            return "ask", f"Remote psql via {t} — prompt"
+
+    # A connection service resolves the host from an external file we can't
+    # read — we can't prove it's local, so prompt.
+    if _PSQL_SERVICE_RE.search(command):
+        return "ask", "psql uses a connection service (host not statically verifiable) — prompt"
+
+    # Collect every host the command targets.
+    hosts = []
+    for rx in _PSQL_HOST_RES:
+        for m in rx.finditer(command):
+            hosts.append(_clean_psql_host(m.group(1)))
+
+    remote = [
+        h for h in hosts
+        if h.lower() not in local_hosts and not h.startswith("/")
+    ]
+    if remote:
+        uniq = ", ".join(sorted(set(remote)))
+        return "ask", f"psql targets non-local host(s): {uniq}"
+
+    # Local psql (explicit local host or no host = unix socket).  Before
+    # auto-approving, make sure no *other* ask keyword (rm/mv/...) rides along
+    # in the same line — if it does, defer so that risk still prompts.
+    normalized = command
+    for safe in rules.get("safe_substrings", []):
+        normalized = normalized.replace(safe, "")
+    normalized = _strip_quoted_contents(normalized)
+    normalized = _strip_comments(normalized)
+    for kw in rules.get("ask", {}).get("keywords", []):
+        if _keyword_match(kw, normalized):
+            return None
+
+    return "allow", "Local psql — auto-approved"
+
+
 # Tokens that separate one simple command from the next in a chain.
 _CMD_SEPARATORS = {"&&", "||", ";", "|", "&", "(", ")"}
 
@@ -802,6 +903,11 @@ def _decide_single(command, config, cwd=""):
     docker_result = check_docker_scoped(command, config)
     if docker_result is not None:
         return docker_result
+
+    # psql host-scoped rules: auto-approve local psql, prompt for remote psql
+    psql_result = check_psql_scoped(command, config)
+    if psql_result is not None:
+        return psql_result
 
     # Ask keywords (second priority - also catches failed scoped checks)
     for kw in rules.get("ask", {}).get("keywords", []):

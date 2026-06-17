@@ -68,6 +68,16 @@ kubectl_write_subcommands = [
 helm_write_subcommands = ["install", "upgrade", "uninstall", "rollback", "delete"]
 helmfile_write_subcommands = ["apply", "sync", "destroy", "delete"]
 
+# Host-aware psql rules: auto-approve psql against the LOCAL machine's database
+# (-h localhost/127.0.0.1/::1, a unix socket, or no host), and prompt (ask) when
+# psql targets a remote host or runs on another machine via ssh/kubectl/rancher.
+# Lets local dev-DB writes (DELETE/DROP/etc.) flow through while still catching
+# queries against non-localhost / production databases.
+[rules.psql_scoped]
+enabled = true
+local_hosts = ["localhost", "127.0.0.1", "::1"]
+remote_wrappers = ["ssh", "kubectl", "rancher"]
+
 # Allow keywords (not strictly needed since default is approve, but explicit)
 [rules.allow]
 keywords = []

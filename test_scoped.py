@@ -14,10 +14,13 @@ from approver import (
     build_allowed_dirs,
     check_docker_scoped,
     check_kubectl_scoped,
+    check_psql_scoped,
     check_scoped_rules,
     decide,
+    extract_command,
     extract_path_args,
     find_git_root,
+    normalize,
     resolve_and_check_paths,
 )
 
@@ -1856,6 +1859,385 @@ class TestCheckKubectlScoped(unittest.TestCase):
 
     def test_no_kubectl_config_section_returns_none(self):
         self.assertIsNone(check_kubectl_scoped("kubectl delete ns foo", {"rules": {}}))
+
+
+class TestCheckPsqlScoped(unittest.TestCase):
+    """Host-aware psql guard: local auto-approves, remote prompts."""
+
+    def setUp(self):
+        self.config = {
+            "rules": {
+                "psql_scoped": {
+                    "enabled": True,
+                    "local_hosts": ["localhost", "127.0.0.1", "::1"],
+                    "remote_wrappers": ["ssh", "kubectl", "rancher"],
+                },
+                "ask": {"keywords": ["rm ", "mv "]},
+                "safe_substrings": ["--rm"],
+            }
+        }
+
+    def _act(self, command):
+        r = check_psql_scoped(command, self.config)
+        return r[0] if r else None
+
+    # --- local psql auto-approves (even destructive SQL) ---
+
+    def test_local_host_delete_allows(self):
+        self.assertEqual(
+            self._act('PGPASSWORD=x psql -h localhost -d g -c "DELETE FROM \\"Users\\""'),
+            "allow",
+        )
+
+    def test_local_host_drop_allows(self):
+        self.assertEqual(self._act('psql -h localhost -d g -c "DROP TABLE foo"'), "allow")
+
+    def test_loopback_ip_allows(self):
+        self.assertEqual(self._act('psql -h 127.0.0.1 -p 5434 -d m -c "DELETE FROM x"'), "allow")
+
+    def test_no_host_unix_socket_allows(self):
+        self.assertEqual(self._act('psql -U glints -d glints -c "SELECT 1"'), "allow")
+
+    def test_host_equals_flag_allows(self):
+        self.assertEqual(self._act('psql --host=localhost -d g -c "DELETE FROM x"'), "allow")
+
+    def test_local_docker_exec_allows(self):
+        # docker exec is NOT a remote wrapper → local dev container.
+        self.assertEqual(
+            self._act('docker exec pg-1 psql -U glints -d g -c "DROP INDEX i"'),
+            "allow",
+        )
+
+    # --- remote psql prompts ---
+
+    def test_remote_hostname_asks(self):
+        self.assertEqual(
+            self._act('PGPASSWORD=x psql -h prod-db.internal -d a -c "DELETE FROM users"'),
+            "ask",
+        )
+
+    def test_remote_ip_asks(self):
+        self.assertEqual(self._act('psql -h 10.0.5.20 -d a -c "DROP TABLE x"'), "ask")
+
+    def test_remote_conn_uri_asks(self):
+        self.assertEqual(self._act('psql postgres://u:p@prod-host:5432/db -c "DELETE FROM x"'), "ask")
+
+    def test_ssh_wrapped_localhost_asks(self):
+        # -h localhost inside ssh is the *remote* box's localhost.
+        self.assertEqual(
+            self._act('ssh prod "PGPASSWORD=x psql -h localhost -c \\"DELETE FROM x\\""'),
+            "ask",
+        )
+
+    def test_kubectl_exec_asks(self):
+        self.assertEqual(
+            self._act('kubectl exec pg-0 -- psql -U g -c "DELETE FROM x"'), "ask"
+        )
+
+    def test_rancher_kubectl_exec_asks(self):
+        self.assertEqual(
+            self._act('rancher kubectl exec -n d pg-0 -- psql -U g -c "DELETE FROM x"'),
+            "ask",
+        )
+
+    # --- non-local must be caught regardless of read vs write ---
+    # A remote SELECT is just as much "non-local" as a remote DELETE; both ask.
+
+    def test_remote_select_read_asks(self):
+        self.assertEqual(self._act('psql -h prod-db -d a -c "SELECT * FROM users"'), "ask")
+
+    def test_ssh_wrapped_select_read_asks(self):
+        # Real-world form: ssh host "psql -h localhost ... SELECT ..." → remote box.
+        self.assertEqual(
+            self._act(
+                'ssh oracle.example.com "PGPASSWORD=x psql -h localhost -d g -t -A '
+                '-c \\"SELECT a, b FROM \\\\\\"Jobs\\\\\\"\\""'
+            ),
+            "ask",
+        )
+
+    # --- bypass forms that must NOT slip through as allow ---
+
+    def test_remote_no_space_h_flag_asks(self):
+        # `-hHOST` with no space after -h.
+        self.assertEqual(self._act('psql -hprod-db -d a -c "DELETE FROM x"'), "ask")
+
+    def test_remote_quoted_conninfo_host_asks(self):
+        # Leading quote before host= must not defeat detection.
+        self.assertEqual(self._act('psql "host=prod dbname=app" -c "DELETE FROM x"'), "ask")
+
+    def test_pghost_env_var_asks(self):
+        self.assertEqual(self._act('PGHOST=prod-db psql -d a -c "DELETE FROM x"'), "ask")
+
+    def test_service_conninfo_asks(self):
+        # Connection service resolves host from a file we can't read → ask.
+        self.assertEqual(self._act('psql service=prod -c "DELETE FROM x"'), "ask")
+
+    def test_pgservice_env_asks(self):
+        self.assertEqual(self._act('PGSERVICE=prod psql -c "DELETE FROM x"'), "ask")
+
+    def test_remote_host_after_query_asks(self):
+        # -h appearing after -c must still be detected.
+        self.assertEqual(self._act('psql -d a -c "DELETE FROM x" -h prod-db'), "ask")
+
+    # --- local lookalikes of the bypass forms still allow ---
+
+    def test_local_no_space_h_flag_allows(self):
+        self.assertEqual(self._act('psql -hlocalhost -d g -c "DELETE FROM x"'), "allow")
+
+    def test_local_pghost_allows(self):
+        self.assertEqual(self._act('PGHOST=127.0.0.1 psql -d g -c "DELETE FROM x"'), "allow")
+
+    def test_quoted_sql_value_host_not_misdetected(self):
+        # host='x' inside a quoted SQL value must not be read as a remote host.
+        self.assertEqual(
+            self._act('psql -h localhost -d g -c "UPDATE c SET host=\'evil\' WHERE id=1"'),
+            "allow",
+        )
+
+    # --- guards / fall-through ---
+
+    def test_local_psql_with_rm_defers(self):
+        # An uncovered ask keyword in the same line → defer (None) so the
+        # normal ask pass surfaces it.
+        self.assertIsNone(self._act('psql -h localhost -c "SELECT 1" && rm -rf /etc/x'))
+
+    def test_non_psql_falls_through(self):
+        self.assertIsNone(self._act("git status && ls -la"))
+
+    def test_disabled_returns_none(self):
+        cfg = {"rules": {"psql_scoped": {"enabled": False}}}
+        self.assertIsNone(check_psql_scoped('psql -h localhost -c "DELETE FROM x"', cfg))
+
+    def test_no_psql_section_returns_none(self):
+        self.assertIsNone(check_psql_scoped('psql -h localhost -c "DELETE FROM x"', {"rules": {}}))
+
+    def test_ssh_word_inside_sql_not_misdetected(self):
+        # "ssh" appearing as a non-command word must not trip remote-wrapper detection.
+        self.assertEqual(
+            self._act('psql -h localhost -c "SELECT ssh FROM keys"'), "allow"
+        )
+
+
+class TestDecideIntegratesScopedChecks(unittest.TestCase):
+    """Integration: decide() must actually route through the psql/kubectl/docker
+    checks.  These guard the *wiring* in _decide_single — direct unit tests of
+    the check_* functions do not, so removing a wiring line would otherwise pass.
+    """
+
+    def setUp(self):
+        self.config = {
+            "rules": {
+                "default_action": "approve",
+                "safe_substrings": ["--rm"],
+                "deny": {"keywords": []},
+                "scoped": {"keywords": ["rm ", "mv "], "allow_project_dir": True, "allowed_dirs": []},
+                "docker_scoped": {"keywords": ["docker rm", "docker rmi"]},
+                "psql_scoped": {
+                    "enabled": True,
+                    "local_hosts": ["localhost", "127.0.0.1", "::1"],
+                    "remote_wrappers": ["ssh", "kubectl", "rancher"],
+                },
+                "kubectl_scoped": {
+                    "production_contexts": ["alicloud-production"],
+                    "kubectl_write_subcommands": ["apply", "delete"],
+                    "helm_write_subcommands": ["install"],
+                    "helmfile_write_subcommands": ["apply"],
+                },
+                "ask": {"keywords": ["rm ", "mv "]},
+                "allow": {"keywords": []},
+            },
+            "tools": {},
+        }
+
+    def _d(self, cmd, cwd=""):
+        return decide("Bash", cmd, self.config, cwd=cwd)[0]
+
+    # psql wiring
+    def test_decide_local_psql_allows(self):
+        self.assertEqual(self._d('psql -h localhost -d g -c "DELETE FROM x"'), "allow")
+
+    def test_decide_remote_psql_asks(self):
+        self.assertEqual(self._d('psql -h prod-db -d g -c "DELETE FROM x"'), "ask")
+
+    def test_decide_ssh_wrapped_psql_asks(self):
+        # The exact leak proven by the sabotage check — must stay caught via decide().
+        self.assertEqual(self._d('ssh prod "psql -h localhost -c DELETE"'), "ask")
+
+    # kubectl wiring
+    def test_decide_prod_kubectl_asks(self):
+        self.assertEqual(self._d("kubectl delete ns foo --context alicloud-production"), "ask")
+
+    def test_decide_nonprod_kubectl_allows(self):
+        self.assertEqual(self._d("kubectl apply -f x.yaml --context dev"), "allow")
+
+    # docker wiring
+    def test_decide_docker_rm_literal_allows(self):
+        self.assertEqual(self._d("docker rm my-container"), "allow")
+
+    def test_decide_docker_rm_expansion_asks(self):
+        self.assertEqual(self._d("docker rm $(docker ps -aq)"), "ask")
+
+
+class TestDecideMisc(unittest.TestCase):
+    """decide() branches: allow keyword, per-tool defaults, non-Bash skip,
+    multiline most-restrictive."""
+
+    def _cfg(self, **over):
+        base = {
+            "rules": {
+                "default_action": "approve",
+                "deny": {"keywords": ["secret-deny"]},
+                "ask": {"keywords": ["please-ask"]},
+                "allow": {"keywords": ["safe-allow"]},
+            },
+            "tools": {},
+        }
+        base["rules"].update(over.get("rules", {}))
+        base.update({k: v for k, v in over.items() if k != "rules"})
+        return base
+
+    def test_allow_keyword_matches(self):
+        action, reason = decide("Bash", "safe-allow --now", self._cfg())
+        self.assertEqual(action, "allow")
+        self.assertIn("allow keyword", reason)
+
+    def test_non_bash_tool_skips_keywords(self):
+        # "please-ask" would match an ask keyword, but only Bash is keyword-checked.
+        action, reason = decide("WebSearch", "please-ask about rm ", self._cfg())
+        self.assertEqual(action, "allow")
+        self.assertIn("Skipped keyword check", reason)
+
+    def test_non_bash_tool_per_tool_default(self):
+        cfg = self._cfg()
+        cfg["tools"] = {"WebFetch": {"default_action": "ask"}}
+        action, reason = decide("WebFetch", "http://x", cfg)
+        self.assertEqual(action, "ask")
+        self.assertIn("Tool default", reason)
+
+    def test_bash_per_tool_default_when_no_keyword(self):
+        cfg = self._cfg()
+        cfg["tools"] = {"Bash": {"default_action": "ask"}}
+        action, reason = decide("Bash", "echo nothing-special", cfg)
+        self.assertEqual(action, "ask")
+        self.assertIn("Tool default", reason)
+
+    def test_global_default_when_no_match(self):
+        action, reason = decide("Bash", "echo hello", self._cfg())
+        self.assertEqual(action, "allow")
+        self.assertIn("Global default", reason)
+
+    def test_multiline_most_restrictive_wins(self):
+        # One safe line + one ask line → overall ask.
+        action, _ = decide("Bash", "echo hi\nplease-ask now", self._cfg())
+        self.assertEqual(action, "ask")
+
+    def test_multiline_deny_wins(self):
+        action, _ = decide("Bash", "echo hi\nplease-ask now\nsecret-deny", self._cfg())
+        self.assertEqual(action, "deny")
+
+    def test_deny_beats_ask_and_allow(self):
+        action, _ = decide("Bash", "safe-allow secret-deny please-ask", self._cfg())
+        self.assertEqual(action, "deny")
+
+
+class TestExtractCommand(unittest.TestCase):
+    """extract_command pulls the actionable string out of tool_input."""
+
+    def test_bash_command_key(self):
+        self.assertEqual(extract_command("Bash", {"command": "ls -la"}), "ls -la")
+
+    def test_read_file_path_key(self):
+        self.assertEqual(extract_command("Read", {"file_path": "/a/b.txt"}), "/a/b.txt")
+
+    def test_grep_pattern_key(self):
+        self.assertEqual(extract_command("Grep", {"pattern": "foo"}), "foo")
+
+    def test_priority_command_over_others(self):
+        # 'command' is checked before 'file_path'.
+        self.assertEqual(
+            extract_command("Bash", {"command": "rm x", "file_path": "/y"}), "rm x"
+        )
+
+    def test_unknown_keys_fall_back_to_json(self):
+        out = extract_command("X", {"weird": "value"})
+        self.assertIn("weird", out)
+        self.assertIn("value", out)
+
+    def test_non_dict_input(self):
+        self.assertEqual(extract_command("X", "raw-string"), "raw-string")
+
+
+class TestNormalize(unittest.TestCase):
+    def test_approve_maps_to_allow(self):
+        self.assertEqual(normalize("approve"), "allow")
+
+    def test_allow_stays_allow(self):
+        self.assertEqual(normalize("allow"), "allow")
+
+    def test_deny_and_ask_unchanged(self):
+        self.assertEqual(normalize("deny"), "deny")
+        self.assertEqual(normalize("ask"), "ask")
+
+
+class TestMainEndToEnd(unittest.TestCase):
+    """Drive approver.py as the real hook: JSON on stdin → decision on stdout.
+
+    Exercises extract_command → decide → permissionDecision mapping with the
+    *shipped* config.toml, so a broken wiring line surfaces here.
+    """
+
+    def _run(self, payload):
+        import json
+        import subprocess
+        proc = subprocess.run(
+            ["python3", os.path.join(os.path.dirname(__file__), "approver.py")],
+            input=json.dumps(payload), capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        return out["hookSpecificOutput"]["permissionDecision"]
+
+    def test_local_psql_allows(self):
+        self.assertEqual(
+            self._run({"tool_name": "Bash",
+                       "tool_input": {"command": 'psql -h localhost -d g -c "DELETE FROM x"'},
+                       "session_id": "t", "cwd": "/tmp"}),
+            "allow",
+        )
+
+    def test_remote_psql_via_ssh_asks(self):
+        # End-to-end guard against the remote-psql leak.
+        self.assertEqual(
+            self._run({"tool_name": "Bash",
+                       "tool_input": {"command": 'ssh prod "psql -h localhost -c DELETE"'},
+                       "session_id": "t", "cwd": "/tmp"}),
+            "ask",
+        )
+
+    def test_remote_psql_host_asks(self):
+        self.assertEqual(
+            self._run({"tool_name": "Bash",
+                       "tool_input": {"command": 'psql -h prod-db -d g -c "DELETE FROM x"'},
+                       "session_id": "t", "cwd": "/tmp"}),
+            "ask",
+        )
+
+    def test_plain_command_allows(self):
+        self.assertEqual(
+            self._run({"tool_name": "Bash", "tool_input": {"command": "git status"},
+                       "session_id": "t", "cwd": "/tmp"}),
+            "allow",
+        )
+
+    def test_empty_stdin_is_noop(self):
+        import subprocess
+        proc = subprocess.run(
+            ["python3", os.path.join(os.path.dirname(__file__), "approver.py")],
+            input="", capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
 
 
 if __name__ == "__main__":
