@@ -77,6 +77,14 @@ helmfile_write_subcommands = ["apply", "sync", "destroy", "delete"]
 enabled = true
 local_hosts = ["localhost", "127.0.0.1", "::1"]
 remote_wrappers = ["ssh", "kubectl", "rancher"]
+# Trusted dev VMs reachable over ssh. When psql is wrapped in `ssh <trusted>`
+# and connects to that VM's OWN local DB (-h localhost/127.0.0.1/::1, unix
+# socket, or no host), auto-approve — even destructive SQL — treating the VM
+# like a local dev box. If the inner psql targets a different host (the VM used
+# as a proxy/jump to another DB), or a second untrusted ssh hop appears, it
+# still prompts. Matches bare host or user@host. Only relaxes the `ssh` wrapper,
+# never kubectl/rancher.
+trusted_remote_hosts = ["oracle.seahyingcong.com"]
 
 # Allow keywords (not strictly needed since default is approve, but explicit)
 [rules.allow]

@@ -607,6 +607,42 @@ def _clean_psql_host(h):
     return h.strip().strip("'\"").strip("\\").strip("'\"").strip()
 
 
+# ssh option flags that consume the *following* token as their value, so the
+# real destination is not mistaken for one of their arguments.
+_SSH_ARG_FLAGS = {
+    "-i", "-p", "-o", "-l", "-F", "-L", "-R", "-D", "-b", "-c", "-e",
+    "-m", "-O", "-Q", "-S", "-W", "-w", "-J", "-B", "-E", "-I",
+}
+
+
+def _host_part(dest):
+    """Host portion of an ssh destination, dropping any ``user@`` prefix and
+    a ``ssh://`` scheme/port.  ``ubuntu@oracle.example.com`` -> ``oracle.example.com``."""
+    dest = dest.strip().strip("'\"")
+    if dest.startswith("ssh://"):
+        dest = dest[len("ssh://"):]
+    if "@" in dest:
+        dest = dest.rsplit("@", 1)[1]
+    # Drop any :port or trailing path.
+    dest = dest.split("/", 1)[0].split(":", 1)[0]
+    return dest.lower()
+
+
+def _ssh_destination(tokens, i):
+    """First non-flag token after the ``ssh`` at index ``i`` — its destination."""
+    j = i + 1
+    while j < len(tokens):
+        t = tokens[j]
+        if t in _SSH_ARG_FLAGS:
+            j += 2  # skip the flag and the value it consumes
+            continue
+        if t.startswith("-"):
+            j += 1  # bare flag, no separate value
+            continue
+        return t
+    return None
+
+
 def check_psql_scoped(command, config):
     """Host-aware psql access control.
 
@@ -632,12 +668,21 @@ def check_psql_scoped(command, config):
 
     local_hosts = {h.lower() for h in psql_cfg.get("local_hosts", [])} | PSQL_LOCAL_HOSTS
     wrappers = tuple(psql_cfg.get("remote_wrappers", PSQL_REMOTE_WRAPPERS))
+    trusted_hosts = {_host_part(h) for h in psql_cfg.get("trusted_remote_hosts", [])}
 
     # A remote wrapper means psql executes on another machine — even
-    # `-h localhost` is that machine's localhost.  Always prompt.
+    # `-h localhost` is that machine's localhost.  Prompt — UNLESS it's an
+    # `ssh` into a trusted dev VM, in which case psql against that VM's own DB
+    # is treated like local.  The inner host check below still catches the VM
+    # being used as a proxy (psql -h <other-host>), and a second untrusted
+    # wrapper hop further down still trips this loop.
     tokens = command.split()
     for i, t in enumerate(tokens):
         if t in wrappers and _is_command_position(tokens, i):
+            if t == "ssh":
+                dest = _ssh_destination(tokens, i)
+                if dest and _host_part(dest) in trusted_hosts:
+                    continue
             return "ask", f"Remote psql via {t} — prompt"
 
     # A connection service resolves the host from an external file we can't

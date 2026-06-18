@@ -28,6 +28,7 @@ Registered as a `PreToolUse` hook in `~/.claude/settings.json`. Every tool call 
 - `rules.psql_scoped.enabled` — host-aware psql gating (default in repo: `true`)
 - `rules.psql_scoped.local_hosts` — hostnames treated as the local DB (auto-approve); `localhost`/`127.0.0.1`/`::1`/no-host are always local
 - `rules.psql_scoped.remote_wrappers` — command words (`ssh`, `kubectl`, `rancher`) that mean psql runs on another machine, forcing `ask` even for `-h localhost`
+- `rules.psql_scoped.trusted_remote_hosts` — ssh destinations (e.g. `oracle.seahyingcong.com`) treated as trusted dev VMs: `ssh <host> … psql` against that VM's own local DB auto-approves; using the VM as a proxy to another host still prompts
 - `tools.<ToolName>.default_action` — per-tool override
 
 Keyword matching only applies to `Bash` tool calls (the `KEYWORD_MATCH_TOOLS` set). All other tools (WebSearch, Read, Grep, ToolSearch, etc.) skip keyword checks and use per-tool or global defaults - this prevents false positives like "form" matching "rm " in search queries.
@@ -50,7 +51,9 @@ Auto-approves `psql` commands (including destructive SQL like `DELETE`/`DROP`) w
 
 - the parsed host is non-local. Hosts are read from `-h <host>` / `-h<host>` (no space), `--host`/`--host=`, a `postgres://` URI, a `host=` conninfo key (even when quote-prefixed), or an inline `PGHOST=` env assignment — wherever they appear in the command (e.g. `-h` after `-c`);
 - a connection **service** is used (`service=` / `PGSERVICE=`) — the host lives in an unreadable `pg_service.conf`, so we can't prove it's local; **or**
-- psql is wrapped by a `remote_wrappers` command (`ssh`, `kubectl`, `rancher`) appearing at a command position — even `-h localhost` then refers to the *remote* box's localhost.
+- psql is wrapped by a `remote_wrappers` command (`ssh`, `kubectl`, `rancher`) appearing at a command position — even `-h localhost` then refers to the *remote* box's localhost. **Exception:** an `ssh` into a `trusted_remote_hosts` VM is exempt (see below).
+
+**Trusted dev VMs (`trusted_remote_hosts`):** when psql is wrapped in `ssh <trusted-host>` and connects to that VM's **own** local DB (`-h localhost`/`127.0.0.1`/`::1`, unix socket, or no host), it auto-approves — destructive SQL included — treating the VM like a local dev box. The exemption only relaxes the `ssh` wrapper, never `kubectl`/`rancher`. The VM-as-a-proxy case still prompts: if the inner psql targets a different host (`ssh oracle 'psql -h prod-db …'`), the normal non-local host check catches it → `ask`. The ssh destination is matched against the configured list as bare host or `user@host` (`ubuntu@oracle…` matches `oracle…`), skipping ssh option flags like `-i <key>`/`-p <port>` when locating it. With an empty/absent `trusted_remote_hosts`, ssh-wrapped psql prompts as before. Caveat: nested ssh (`ssh oracle 'ssh otherbox psql …'`) isn't reliably detected as a second hop because of quote-splitting, but an inner `psql -h <otherhost>` is caught regardless.
 
 A bare `docker exec … psql` (not under a remote wrapper) is treated as a local dev container → allow. If a local-psql line also contains an uncovered ask keyword (`rm`/`mv`/…), the check defers so that risk still prompts. Host parsing runs against the raw command, so an unquoted `host=` substring inside SQL may cause a (safe-direction) extra prompt; a quoted SQL value like `host='x'` is not misread. Regression tests for every local/remote/bypass form live in `test_scoped.py::TestCheckPsqlScoped`.
 

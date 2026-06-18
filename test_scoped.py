@@ -2018,6 +2018,93 @@ class TestCheckPsqlScoped(unittest.TestCase):
             self._act('psql -h localhost -c "SELECT ssh FROM keys"'), "allow"
         )
 
+    # --- trusted dev VMs: ssh into a trusted box's OWN DB auto-approves ---
+
+    def _act_trusted(self, command, hosts=("oracle.seahyingcong.com",)):
+        cfg = {
+            "rules": {
+                **self.config["rules"],
+                "psql_scoped": {
+                    **self.config["rules"]["psql_scoped"],
+                    "trusted_remote_hosts": list(hosts),
+                },
+            }
+        }
+        r = check_psql_scoped(command, cfg)
+        return r[0] if r else None
+
+    def test_trusted_ssh_localhost_delete_allows(self):
+        self.assertEqual(
+            self._act_trusted(
+                'ssh oracle.seahyingcong.com '
+                '\'PGPASSWORD=x psql -h localhost -d g -c "DELETE FROM \\"Users\\""\''
+            ),
+            "allow",
+        )
+
+    def test_trusted_ssh_user_at_host_allows(self):
+        # user@host destination must match the bare trusted host.
+        self.assertEqual(
+            self._act_trusted(
+                'ssh ubuntu@oracle.seahyingcong.com '
+                '\'psql -h localhost -d g -c "DROP TABLE foo"\''
+            ),
+            "allow",
+        )
+
+    def test_trusted_ssh_unix_socket_allows(self):
+        # No inner -h → the VM's own unix socket, still its own DB.
+        self.assertEqual(
+            self._act_trusted('ssh oracle.seahyingcong.com \'psql -U g -d g -c "SELECT 1"\''),
+            "allow",
+        )
+
+    def test_trusted_ssh_with_ssh_flags_allows(self):
+        # -i <key> / -p <port> before the destination must be skipped.
+        self.assertEqual(
+            self._act_trusted(
+                'ssh -i ~/.ssh/id -p 2222 oracle.seahyingcong.com '
+                '\'psql -h localhost -c "DELETE FROM x"\''
+            ),
+            "allow",
+        )
+
+    def test_trusted_ssh_proxy_to_other_host_asks(self):
+        # VM used as a jump/proxy: inner psql targets a different host → prompt.
+        self.assertEqual(
+            self._act_trusted(
+                'ssh oracle.seahyingcong.com \'psql -h prod-db.internal -c "DELETE FROM x"\''
+            ),
+            "ask",
+        )
+
+    def test_untrusted_ssh_localhost_still_asks(self):
+        # A non-trusted ssh target gets the original treatment.
+        self.assertEqual(
+            self._act_trusted('ssh prod \'psql -h localhost -c "DELETE FROM x"\''),
+            "ask",
+        )
+
+    def test_trusted_host_via_kubectl_still_asks(self):
+        # Trust only relaxes the `ssh` wrapper, never kubectl/rancher.
+        self.assertEqual(
+            self._act_trusted(
+                'kubectl exec pg-0 -- psql -h localhost -c "DELETE FROM x"',
+                hosts=("oracle.seahyingcong.com",),
+            ),
+            "ask",
+        )
+
+    def test_no_trusted_hosts_configured_ssh_asks(self):
+        # Empty/absent trusted list → ssh-wrapped psql prompts as before.
+        self.assertEqual(
+            self._act_trusted(
+                'ssh oracle.seahyingcong.com \'psql -h localhost -c "DELETE FROM x"\'',
+                hosts=(),
+            ),
+            "ask",
+        )
+
 
 class TestDecideIntegratesScopedChecks(unittest.TestCase):
     """Integration: decide() must actually route through the psql/kubectl/docker
